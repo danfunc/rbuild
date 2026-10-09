@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod backend;
+pub mod cargo_output;
 pub mod client;
 pub mod config;
 pub mod debug_map;

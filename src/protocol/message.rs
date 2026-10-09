@@ -124,6 +124,8 @@ pub enum Message {
         command: Option<String>,
         targets: Vec<String>,
         flags: Vec<String>,
+        #[serde(default)]
+        envs: Vec<(String, String)>,
     },
     CollectArtifactsResponse {
         ok: bool,
@@ -162,4 +164,21 @@ pub enum Message {
     },
     Ping,
     Pong,
+}
+
+/// Reserved `envs` key. The agent prepends its value (a `:`-separated directory list) to the
+/// inherited `PATH` of each remote command; it is never exported under its own name.
+pub const PATH_PREPEND_ENV: &str = "RBUILD_PATH_PREPEND";
+
+/// Builds the `envs` entry that carries extra remote PATH directories, or nothing when empty.
+pub fn path_prepend_envs(entries: &[String]) -> Vec<(String, String)> {
+    let joined: Vec<&str> = entries
+        .iter()
+        .map(|e| e.trim())
+        .filter(|e| !e.is_empty())
+        .collect();
+    if joined.is_empty() {
+        return Vec::new();
+    }
+    vec![(PATH_PREPEND_ENV.to_string(), joined.join(":"))]
 }

@@ -22,6 +22,18 @@ pub struct Config {
     #[serde(default = "default_build_root")]
     pub build_root: String,
 
+    /// Remote bazelisk executable: a name resolved on the remote PATH or an absolute path.
+    #[serde(default = "default_bazelisk_path")]
+    pub bazelisk_path: String,
+
+    /// Remote cargo executable: a name resolved on the remote PATH or an absolute path.
+    #[serde(default = "default_cargo_path")]
+    pub cargo_path: String,
+
+    /// Directories prepended to the remote PATH of build and cquery commands. Empty by default.
+    #[serde(default)]
+    pub remote_path_entries: Vec<String>,
+
     pub client_id: Option<String>,
 
     #[serde(default, alias = "extra_excludes")]
@@ -40,6 +52,14 @@ fn default_build_root() -> String {
     "/srv/build".to_string()
 }
 
+fn default_bazelisk_path() -> String {
+    "bazelisk".to_string()
+}
+
+fn default_cargo_path() -> String {
+    "cargo".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -49,6 +69,9 @@ impl Default for Config {
             artifact_globs: Vec::new(),
             agent_path: default_agent_path(),
             build_root: default_build_root(),
+            bazelisk_path: default_bazelisk_path(),
+            cargo_path: default_cargo_path(),
+            remote_path_entries: Vec::new(),
             client_id: None,
             excludes: Vec::new(),
         }
@@ -120,5 +143,26 @@ extra_excludes = ["legacy/"]
         assert_eq!(cfg.build_root, "/srv/build");
         assert_eq!(cfg.client_id, None);
         assert_eq!(cfg.excludes, vec!["legacy/"]);
+    }
+
+    #[test]
+    fn test_remote_tool_settings_default_and_parse() {
+        let defaults: Config = toml::from_str("remote = \"h\"\n").unwrap();
+        assert_eq!(defaults.bazelisk_path, "bazelisk");
+        assert_eq!(defaults.cargo_path, "cargo");
+        assert!(defaults.remote_path_entries.is_empty());
+
+        let toml_str = r#"
+bazelisk_path = "/opt/bazel/bin/bazelisk"
+cargo_path = "/home/u/.cargo/bin/cargo"
+remote_path_entries = ["/opt/bazel/bin", "/usr/local/go/bin"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.bazelisk_path, "/opt/bazel/bin/bazelisk");
+        assert_eq!(cfg.cargo_path, "/home/u/.cargo/bin/cargo");
+        assert_eq!(
+            cfg.remote_path_entries,
+            vec!["/opt/bazel/bin", "/usr/local/go/bin"]
+        );
     }
 }

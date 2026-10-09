@@ -1,6 +1,9 @@
 use std::path::Path;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire protocol version. Bump on any change to message layout or meaning.
+///
+/// 2: `CollectArtifactsRequest.envs` and the reserved `RBUILD_PATH_PREPEND` env key.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Returns the build ID of the current binary or environment.
 ///

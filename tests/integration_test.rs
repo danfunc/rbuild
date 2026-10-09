@@ -567,6 +567,169 @@ exit 1
     let _ = agent_thread.join();
 }
 
+/// Writes a fake bazelisk that answers `info output_path` and `cquery`.
+/// When `require_path_prefix` is set, `cquery` fails unless PATH starts with that directory.
+fn write_fake_bazelisk(
+    dir: &Path,
+    output_path: &Path,
+    cquery_line: &str,
+    require_path_prefix: Option<&Path>,
+) -> std::path::PathBuf {
+    let require = match require_path_prefix {
+        Some(prefix) => format!("{}:*", prefix.display()),
+        None => "*".to_string(),
+    };
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = "info" ] && [ "$2" = "output_path" ]; then
+    echo "{output}"
+    exit 0
+fi
+if [ "$1" = "cquery" ]; then
+    case "$PATH" in
+        {require}) ;;
+        *) echo "PATH lacks the configured prefix" >&2; exit 3 ;;
+    esac
+    echo "{line}"
+    exit 0
+fi
+exit 1
+"#,
+        output = output_path.display(),
+        require = require,
+        line = cquery_line,
+    );
+    let fake = dir.join("fake_bazelisk.sh");
+    fs::write(&fake, script).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+#[test]
+fn test_artifact_collection_accepts_symlinked_bazel_output_root() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let remote_base = temp_root.path().join("srv_build");
+    let client_out_dir = temp_root.path().join(".rbuild-out");
+    let output_root = temp_root.path().join("bazel_output_root");
+    let marker_bin = temp_root.path().join("marker_bin");
+    fs::create_dir_all(&remote_base).unwrap();
+    fs::create_dir_all(output_root.join("k8-fastbuild/bin/pkg")).unwrap();
+    fs::write(output_root.join("k8-fastbuild/bin/pkg/app"), b"built app").unwrap();
+    fs::create_dir_all(&marker_bin).unwrap();
+
+    let (mut session, agent_thread) = setup_agent_client_pair(&remote_base);
+    session.handshake(None).unwrap();
+    let wt_str = session.lock_worktree("user1", "myrepo", "main").unwrap();
+    let wt = Path::new(&wt_str);
+    // Bazel-created layout: worktree/bazel-out is a symlink to the real output root outside the worktree.
+    std::os::unix::fs::symlink(&output_root, wt.join("bazel-out")).unwrap();
+
+    let fake = write_fake_bazelisk(
+        temp_root.path(),
+        &output_root,
+        "bazel-out/k8-fastbuild/bin/pkg/app",
+        Some(&marker_bin),
+    );
+    let envs = rbuild::protocol::message::path_prepend_envs(&[marker_bin.display().to_string()]);
+
+    let count = session
+        .collect_artifacts_with_envs(
+            &client_out_dir,
+            Some(&fake.to_string_lossy()),
+            &["//pkg:app".to_string()],
+            &[],
+            &envs,
+        )
+        .expect("Artifact under the reported Bazel output root must be accepted");
+
+    assert_eq!(count, 1);
+    assert_eq!(
+        fs::read(client_out_dir.join("pkg/app")).unwrap(),
+        b"built app"
+    );
+
+    drop(session);
+    let _ = agent_thread.join();
+}
+
+#[test]
+fn test_artifact_collection_rejects_symlink_to_unrelated_root() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let remote_base = temp_root.path().join("srv_build");
+    let client_out_dir = temp_root.path().join(".rbuild-out");
+    let unrelated = temp_root.path().join("unrelated_root");
+    let real_output_root = temp_root.path().join("bazel_output_root");
+    fs::create_dir_all(&remote_base).unwrap();
+    fs::create_dir_all(unrelated.join("k8-fastbuild/bin/pkg")).unwrap();
+    fs::write(unrelated.join("k8-fastbuild/bin/pkg/app"), b"foreign app").unwrap();
+    fs::create_dir_all(&real_output_root).unwrap();
+
+    let (mut session, agent_thread) = setup_agent_client_pair(&remote_base);
+    session.handshake(None).unwrap();
+    let wt_str = session.lock_worktree("user1", "myrepo", "main").unwrap();
+    let wt = Path::new(&wt_str);
+    std::os::unix::fs::symlink(&unrelated, wt.join("bazel-out")).unwrap();
+
+    let fake = write_fake_bazelisk(
+        temp_root.path(),
+        &real_output_root,
+        "bazel-out/k8-fastbuild/bin/pkg/app",
+        None,
+    );
+
+    let err = session
+        .collect_artifacts(
+            &client_out_dir,
+            Some(&fake.to_string_lossy()),
+            &["//pkg:app".to_string()],
+            &[],
+        )
+        .expect_err("Artifact under an unrelated root must be rejected");
+    assert!(
+        format!("{err:#}").contains("escapes worktree"),
+        "Error must report the escape: {err:#}"
+    );
+    assert!(!client_out_dir.join("pkg/app").exists());
+
+    drop(session);
+    let _ = agent_thread.join();
+}
+
+#[test]
+fn test_remote_path_prepend_applies_to_commands_without_exporting_key() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let remote_base = temp_root.path().join("srv_build");
+    fs::create_dir_all(&remote_base).unwrap();
+
+    let (mut session, agent_thread) = setup_agent_client_pair(&remote_base);
+    session.handshake(None).unwrap();
+    session.lock_worktree("user1", "myrepo", "main").unwrap();
+
+    let envs = rbuild::protocol::message::path_prepend_envs(&[
+        "/opt/rbuild-test/bin".to_string(),
+        " ".to_string(),
+        "/usr/local/rbuild-test/bin".to_string(),
+    ]);
+    let script = "printf '%s' \"$PATH\"; printf ' %s' \"${RBUILD_PATH_PREPEND-unset}\"";
+    let (code, out, _) = session
+        .run_remote_command_capture("sh", &["-c".to_string(), script.to_string()], &envs)
+        .unwrap();
+
+    assert_eq!(code, 0);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.starts_with("/opt/rbuild-test/bin:/usr/local/rbuild-test/bin:"),
+        "Configured entries must lead PATH: {text}"
+    );
+    assert!(
+        text.ends_with(" unset"),
+        "Reserved key must not be exported to the command: {text}"
+    );
+
+    drop(session);
+    let _ = agent_thread.join();
+}
+
 #[test]
 fn test_agent_binary_self_update_in_isolated_temp_dir() {
     let temp_root = tempfile::tempdir().unwrap();
@@ -925,6 +1088,12 @@ echo "{\"reason\":\"compiler-artifact\",\"filenames\":[\"$(pwd)/target/debug/dem
     });
     assert_eq!(bytes, b"fake-linux-binary");
     assert!(repo.join(".rbuild-out/rbuild-debug-map.json").exists());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("compiler-artifact"),
+        "Raw cargo JSON must not reach stdout: {stdout}"
+    );
+    assert!(stdout.contains("rbuild: Cargo reported 1 artifact path(s)."));
 }
 
 #[test]

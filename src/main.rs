@@ -2,10 +2,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rbuild::agent::run_agent_loop;
 use rbuild::backend::{BackendKind, select_backend};
+use rbuild::cargo_output::{ArtifactSelection, artifact_paths, render_human_output};
 use rbuild::client::ClientSession;
 use rbuild::client::transport::{LocalProcessTransport, SshTransport, Transport};
 use rbuild::config::Config;
+use rbuild::protocol::message::path_prepend_envs;
 use rbuild::sync::manifest::ManifestCache;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -38,6 +41,31 @@ pub struct Cli {
 
     #[arg(long, help = "Client identifier (e.g. hostname or username)")]
     pub client_id: Option<String>,
+
+    #[arg(
+        long,
+        help = "Remote bazelisk executable: a name on the remote PATH or an absolute path"
+    )]
+    pub bazelisk_path: Option<String>,
+
+    #[arg(
+        long,
+        help = "Remote cargo executable: a name on the remote PATH or an absolute path"
+    )]
+    pub cargo_path: Option<String>,
+
+    #[arg(
+        long = "remote-path-entry",
+        help = "Directory prepended to the remote PATH of build commands (repeatable; replaces configured entries)"
+    )]
+    pub remote_path_entry: Vec<String>,
+
+    #[arg(
+        long,
+        value_parser = ["final", "all"],
+        help = "Cargo files to collect: 'final' (executables and cdylib/staticlib, default) or 'all'"
+    )]
+    pub artifacts: Option<String>,
 
     #[arg(long, help = "Repository name")]
     pub repo: Option<String>,
@@ -109,6 +137,20 @@ fn run_client(cli: Cli) -> Result<()> {
         cli.backend.as_deref().or(cfg.backend.as_deref()),
     )?;
 
+    let path_entries = if cli.remote_path_entry.is_empty() {
+        cfg.remote_path_entries.clone()
+    } else {
+        cli.remote_path_entry.clone()
+    };
+    let artifact_selection = ArtifactSelection::parse(cli.artifacts.as_deref().unwrap_or("final"))
+        .ok_or_else(|| anyhow::anyhow!("Unknown --artifacts value; expected final or all"))?;
+    let remote_options = RemoteOptions {
+        bazelisk_path: cli.bazelisk_path.unwrap_or(cfg.bazelisk_path),
+        cargo_path: cli.cargo_path.unwrap_or(cfg.cargo_path),
+        path_envs: path_prepend_envs(&path_entries),
+        artifact_selection,
+    };
+
     println!(
         "rbuild: Connecting via transport '{}' (client='{}', repo='{}', worktree='{}')",
         transport_mode, client_id, repo_name, worktree_name
@@ -131,6 +173,7 @@ fn run_client(cli: Cli) -> Result<()> {
                 backend,
                 &cfg.artifact_globs,
                 &cli.bazel_args,
+                &remote_options,
             )
         }
         "ssh" => {
@@ -153,12 +196,21 @@ fn run_client(cli: Cli) -> Result<()> {
                 backend,
                 &cfg.artifact_globs,
                 &cli.bazel_args,
+                &remote_options,
             )
         }
         other => {
             anyhow::bail!("Unsupported transport '{}'. Use 'local' or 'ssh'", other);
         }
     }
+}
+
+/// Remote tool locations and PATH handling shared by build and cquery commands.
+struct RemoteOptions {
+    bazelisk_path: String,
+    cargo_path: String,
+    path_envs: Vec<(String, String)>,
+    artifact_selection: ArtifactSelection,
 }
 
 fn run_session_workflow<T: Transport>(
@@ -172,6 +224,7 @@ fn run_session_workflow<T: Transport>(
     backend: BackendKind,
     artifact_globs: &[String],
     bazel_args: &[String],
+    remote: &RemoteOptions,
 ) -> Result<()> {
     // Handshake
     session.handshake(local_exe_for_update)?;
@@ -207,11 +260,21 @@ fn run_session_workflow<T: Transport>(
                 0..0,
                 ["build".to_string(), "--message-format=json".to_string()],
             );
-            let (code, stdout, _) = session.run_remote_command_capture("cargo", &args, &[])?;
+            // Cargo's JSON stream is buffered: only its human-readable rendering reaches stdout.
+            let mut stdout = Vec::new();
+            let code = session.run_remote_command_to_writers(
+                &remote.cargo_path,
+                &args,
+                &remote.path_envs,
+                &mut stdout,
+                &mut std::io::stderr(),
+            )?;
+            std::io::stdout().write_all(render_human_output(&stdout).as_bytes())?;
+            std::io::stdout().flush()?;
             if code != 0 {
                 std::process::exit(code);
             }
-            let paths = cargo_artifact_paths(&stdout, Path::new(&remote_path));
+            let paths = artifact_paths(&stdout, Path::new(&remote_path), remote.artifact_selection);
             println!("rbuild: Cargo reported {} artifact path(s).", paths.len());
             if !paths.is_empty() {
                 let output = current_dir.join(".rbuild-out");
@@ -224,7 +287,7 @@ fn run_session_workflow<T: Transport>(
             let (program, args) = bazel_args
                 .split_first()
                 .ok_or_else(|| anyhow::anyhow!("Generic backend requires a command"))?;
-            let code = session.run_remote_command(program, args, &[])?;
+            let code = session.run_remote_command(program, args, &remote.path_envs)?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -241,7 +304,8 @@ fn run_session_workflow<T: Transport>(
             "rbuild: Executing remote bazelisk command: {:?}",
             bazel_args
         );
-        let exit_code = session.run_remote_command("bazelisk", bazel_args, &[])?;
+        let exit_code =
+            session.run_remote_command(&remote.bazelisk_path, bazel_args, &remote.path_envs)?;
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
@@ -262,8 +326,13 @@ fn run_session_workflow<T: Transport>(
                     "rbuild: Collecting build artifacts into '{}'...",
                     out_dir.display()
                 );
-                let count =
-                    session.collect_artifacts(&out_dir, None, &parsed.targets, &parsed.flags)?;
+                let count = session.collect_artifacts_with_envs(
+                    &out_dir,
+                    Some(&remote.bazelisk_path),
+                    &parsed.targets,
+                    &parsed.flags,
+                    &remote.path_envs,
+                )?;
                 println!("rbuild: Successfully collected {} artifact(s).", count);
                 finalize_debug_artifacts(&out_dir, &remote_path, current_dir)?;
             }
@@ -282,67 +351,6 @@ fn finalize_debug_artifacts(out_dir: &Path, remote_root: &str, local_root: &Path
     )?;
     rbuild::debug_map::write_debug_map(out_dir, remote_root, &local)?;
     Ok(())
-}
-
-fn cargo_artifact_paths(json_lines: &[u8], remote_root: &Path) -> Vec<String> {
-    let mut paths = std::collections::BTreeSet::new();
-    for line in json_lines.split(|b| *b == b'\n') {
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("reason").and_then(|v| v.as_str()) != Some("compiler-artifact") {
-            continue;
-        }
-        if let Some(exe) = value.get("executable").and_then(|v| v.as_str()) {
-            if let Some(p) = relativize_remote_path(Path::new(exe), remote_root) {
-                paths.insert(p);
-            }
-        }
-        if let Some(filenames) = value.get("filenames").and_then(|v| v.as_array()) {
-            for filename in filenames.iter().filter_map(|v| v.as_str()) {
-                if let Some(p) = relativize_remote_path(Path::new(filename), remote_root) {
-                    paths.insert(p);
-                }
-            }
-        }
-    }
-    paths.into_iter().collect()
-}
-
-fn relativize_remote_path(path: &Path, root: &Path) -> Option<String> {
-    if let Ok(rel) = path.strip_prefix(root) {
-        return Some(rel.to_string_lossy().to_string());
-    }
-    // Some Unix systems expose the same path through aliases such as /private/var and /var.
-    let root_parts: Vec<_> = root
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    let path_parts: Vec<_> = path
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    for start in 0..root_parts.len() {
-        let suffix = &root_parts[start..];
-        if suffix.len() < 2 || suffix.len() > path_parts.len() {
-            continue;
-        }
-        for i in 0..=path_parts.len() - suffix.len() {
-            if path_parts[i..i + suffix.len()] == *suffix {
-                let rest = &path_parts[i + suffix.len()..];
-                if !rest.is_empty() {
-                    return Some(rest.join("/"));
-                }
-            }
-        }
-    }
-    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,6 +555,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parsing_remote_tool_flags() {
+        let cli = Cli::try_parse_from([
+            "rbuild",
+            "--bazelisk-path",
+            "/opt/bazel/bin/bazelisk",
+            "--cargo-path",
+            "/home/u/.cargo/bin/cargo",
+            "--remote-path-entry",
+            "/opt/a/bin",
+            "--remote-path-entry",
+            "/opt/b/bin",
+            "--artifacts",
+            "all",
+            "build",
+            "//pkg:target",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.bazelisk_path.as_deref(),
+            Some("/opt/bazel/bin/bazelisk")
+        );
+        assert_eq!(cli.cargo_path.as_deref(), Some("/home/u/.cargo/bin/cargo"));
+        assert_eq!(cli.remote_path_entry, vec!["/opt/a/bin", "/opt/b/bin"]);
+        assert_eq!(cli.artifacts.as_deref(), Some("all"));
+        assert_eq!(cli.bazel_args, vec!["build", "//pkg:target"]);
+
+        assert!(Cli::try_parse_from(["rbuild", "--artifacts", "rlib"]).is_err());
+    }
+
+    #[test]
     fn test_cli_parsing_ssh_transport_flags() {
         let cli = Cli::try_parse_from([
             "rbuild",
@@ -574,15 +612,5 @@ mod tests {
         assert_eq!(cli.build_root.as_deref(), Some("/srv/build"));
         assert_eq!(cli.client_id.as_deref(), Some("mac-client"));
         assert_eq!(cli.bazel_args, vec!["build", "//pkg:target"]);
-    }
-
-    #[test]
-    fn cargo_json_artifacts_are_rebased_to_worktree_relative_paths() {
-        let root = Path::new("/srv/build/client/repo/main");
-        let json = br#"{"reason":"compiler-artifact","filenames":["/srv/build/client/repo/main/target/release/rbuild.d","/srv/build/client/repo/main/target/release/rbuild"],"executable":"/srv/build/client/repo/main/target/release/rbuild"}"#;
-        let paths = cargo_artifact_paths(json, root);
-        assert!(paths.contains(&"target/release/rbuild".to_string()));
-        assert!(paths.contains(&"target/release/rbuild.d".to_string()));
-        assert!(!paths.iter().any(|p| p.starts_with('/')));
     }
 }

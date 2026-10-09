@@ -144,16 +144,15 @@ impl<T: Transport> ClientSession<T> {
 
         match self.transport.recv()? {
             Message::HandshakeResponse {
+                protocol_version: remote_protocol,
                 compatible,
                 build_id: remote_build_id,
                 platform: remote_platform,
                 message,
-                ..
             } => {
                 let remote_plat = remote_platform.as_deref().unwrap_or("unknown");
 
-                if compatible {
-                    // Protocol version is compatible.
+                if compatible && remote_protocol == PROTOCOL_VERSION {
                     // Different build IDs across different platforms (e.g. macOS client vs Linux agent) are expected and normal.
                     if local_build_id != remote_build_id {
                         eprintln!(
@@ -163,47 +162,64 @@ impl<T: Transport> ClientSession<T> {
                     }
                     return Ok(());
                 }
+                if compatible {
+                    bail!(
+                        "Remote agent reported compatibility for protocol v{} but this client speaks v{}. Refusing to continue.",
+                        remote_protocol,
+                        PROTOCOL_VERSION
+                    );
+                }
 
-                // If incompatible protocol version, check if self-update is safe and possible
+                let reason = message.unwrap_or_else(|| "Protocol mismatch".to_string());
                 if remote_plat != local_platform {
                     bail!(
-                        "Remote agent is incompatible ({:?}). Cannot self-update cross-platform agent: \
+                        "Remote agent is incompatible ({}). Cannot self-update cross-platform agent: \
                         remote platform is '{}' while local host is '{}'. Sending a local binary would corrupt \
                         the remote host. Please deploy a native-built agent binary on the remote host (e.g. via 'cargo build --release').",
-                        message.unwrap_or_else(|| "Protocol mismatch".to_string()),
+                        reason,
                         remote_plat,
                         local_platform
                     );
                 }
 
-                // If on the same platform, attempt self-update if local binary is available
-                if let Some(exe) = local_exe_path {
-                    let binary_data = fs::read(exe).with_context(|| {
-                        format!(
-                            "Reading local executable for agent update: {}",
-                            exe.display()
-                        )
-                    })?;
-                    let raw_len = binary_data.len() as u64;
-                    let blake3_hash = blake3::hash(&binary_data).to_hex().to_string();
-                    let zstd_data = zstd::encode_all(&binary_data[..], 3)?;
+                let Some(exe) = local_exe_path else {
+                    bail!(
+                        "Remote agent is incompatible ({}): it speaks protocol v{}, this client speaks v{}. \
+                        No local binary is available to deploy.",
+                        reason,
+                        remote_protocol,
+                        PROTOCOL_VERSION
+                    );
+                };
+                let binary_data = fs::read(exe).with_context(|| {
+                    format!(
+                        "Reading local executable for agent update: {}",
+                        exe.display()
+                    )
+                })?;
+                let raw_len = binary_data.len() as u64;
+                let blake3_hash = blake3::hash(&binary_data).to_hex().to_string();
+                let zstd_data = zstd::encode_all(&binary_data[..], 3)?;
 
-                    self.transport.send(&Message::UpdateAgentRequest {
-                        build_id: local_build_id,
-                        raw_len,
-                        blake3: blake3_hash,
-                        zstd_data,
-                    })?;
+                self.transport.send(&Message::UpdateAgentRequest {
+                    build_id: local_build_id,
+                    raw_len,
+                    blake3: blake3_hash,
+                    zstd_data,
+                })?;
 
-                    match self.transport.recv()? {
-                        Message::UpdateAgentResponse { ok: true, .. } => Ok(()),
-                        Message::UpdateAgentResponse { ok: false, error } => {
-                            bail!("Failed to update remote agent binary: {:?}", error);
-                        }
-                        other => bail!("Unexpected response to UpdateAgentRequest: {:?}", other),
+                match self.transport.recv()? {
+                    // The running agent process keeps the old code after its binary is replaced,
+                    // so this session must not proceed. The next connection starts the new binary.
+                    Message::UpdateAgentResponse { ok: true, .. } => bail!(
+                        "Remote agent binary was updated to protocol v{}. The running agent is still the old process: \
+                        reconnect and retry. No worktree was locked and nothing was built.",
+                        PROTOCOL_VERSION
+                    ),
+                    Message::UpdateAgentResponse { ok: false, error } => {
+                        bail!("Failed to update remote agent binary: {:?}", error);
                     }
-                } else {
-                    bail!("Remote agent is incompatible: {:?}", message);
+                    other => bail!("Unexpected response to UpdateAgentRequest: {:?}", other),
                 }
             }
             other => bail!("Unexpected handshake response: {:?}", other),
@@ -471,6 +487,18 @@ impl<T: Transport> ClientSession<T> {
         targets: &[String],
         flags: &[String],
     ) -> Result<usize> {
+        self.collect_artifacts_with_envs(output_dir, command_override, targets, flags, &[])
+    }
+
+    /// Same as [`Self::collect_artifacts`], with extra environment entries for the remote cquery.
+    pub fn collect_artifacts_with_envs(
+        &mut self,
+        output_dir: &Path,
+        command_override: Option<&str>,
+        targets: &[String],
+        flags: &[String],
+        envs: &[(String, String)],
+    ) -> Result<usize> {
         fs::create_dir_all(output_dir)
             .with_context(|| format!("Creating output directory: {}", output_dir.display()))?;
 
@@ -478,6 +506,7 @@ impl<T: Transport> ClientSession<T> {
             command: command_override.map(|s| s.to_string()),
             targets: targets.to_vec(),
             flags: flags.to_vec(),
+            envs: envs.to_vec(),
         })?;
 
         let mut collected = 0;
@@ -630,6 +659,130 @@ mod tests {
             1,
             "Must not send UpdateAgentRequest"
         );
+    }
+
+    fn local_platform() -> String {
+        format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    fn handshake_response(protocol_version: u32, compatible: bool, platform: &str) -> Message {
+        Message::HandshakeResponse {
+            protocol_version,
+            build_id: "remote-build-id".to_string(),
+            compatible,
+            platform: Some(platform.to_string()),
+            message: (!compatible).then(|| "Protocol version mismatch".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_handshake_old_protocol_without_binary_fails_before_lock() {
+        let transport = MockTransport::new(vec![handshake_response(1, false, &local_platform())]);
+        let mut session = ClientSession::new(transport);
+
+        let err = session.handshake(None).unwrap_err().to_string();
+        assert!(err.contains("No local binary"), "{err}");
+        assert_eq!(
+            session.transport.sent.len(),
+            1,
+            "Only HandshakeRequest may be sent; no update, lock, or build"
+        );
+    }
+
+    #[test]
+    fn test_handshake_cross_platform_old_protocol_sends_no_binary() {
+        let transport = MockTransport::new(vec![handshake_response(1, false, "linux-x86_64")]);
+        let mut session = ClientSession::new(transport);
+
+        let exe = tempfile::NamedTempFile::new().unwrap();
+        fs::write(exe.path(), b"client binary").unwrap();
+        let err = session.handshake(Some(exe.path())).unwrap_err().to_string();
+        assert!(
+            err.contains("Cannot self-update cross-platform agent"),
+            "{err}"
+        );
+        assert_eq!(session.transport.sent.len(), 1);
+        assert!(
+            !session
+                .transport
+                .sent
+                .iter()
+                .any(|m| matches!(m, Message::UpdateAgentRequest { .. })),
+            "Binary must not be sent to a different platform"
+        );
+    }
+
+    #[test]
+    fn test_handshake_same_platform_update_requires_reconnect() {
+        let transport = MockTransport::new(vec![
+            handshake_response(1, false, &local_platform()),
+            Message::UpdateAgentResponse {
+                ok: true,
+                error: None,
+            },
+        ]);
+        let mut session = ClientSession::new(transport);
+
+        let exe = tempfile::NamedTempFile::new().unwrap();
+        fs::write(exe.path(), b"client binary").unwrap();
+        let err = session.handshake(Some(exe.path())).unwrap_err().to_string();
+        assert!(err.contains("reconnect and retry"), "{err}");
+        assert_eq!(session.transport.sent.len(), 2);
+        assert!(matches!(
+            session.transport.sent[1],
+            Message::UpdateAgentRequest { .. }
+        ));
+        assert!(
+            !session
+                .transport
+                .sent
+                .iter()
+                .any(|m| matches!(m, Message::LockWorktreeRequest { .. })),
+            "No lock may be requested after an update"
+        );
+    }
+
+    #[test]
+    fn test_handshake_same_platform_update_failure_is_reported() {
+        let transport = MockTransport::new(vec![
+            handshake_response(1, false, &local_platform()),
+            Message::UpdateAgentResponse {
+                ok: false,
+                error: Some("disk full".to_string()),
+            },
+        ]);
+        let mut session = ClientSession::new(transport);
+
+        let exe = tempfile::NamedTempFile::new().unwrap();
+        fs::write(exe.path(), b"client binary").unwrap();
+        let err = session.handshake(Some(exe.path())).unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to update remote agent binary"),
+            "{err}"
+        );
+        assert!(err.contains("disk full"), "{err}");
+    }
+
+    #[test]
+    fn test_handshake_new_protocol_passes_despite_build_id_difference() {
+        let transport = MockTransport::new(vec![handshake_response(
+            PROTOCOL_VERSION,
+            true,
+            "linux-x86_64",
+        )]);
+        let mut session = ClientSession::new(transport);
+
+        session.handshake(None).expect("same protocol must pass");
+        assert_eq!(session.transport.sent.len(), 1);
+    }
+
+    #[test]
+    fn test_handshake_rejects_compatible_claim_with_other_protocol() {
+        let transport = MockTransport::new(vec![handshake_response(1, true, &local_platform())]);
+        let mut session = ClientSession::new(transport);
+
+        let err = session.handshake(None).unwrap_err().to_string();
+        assert!(err.contains("protocol v1"), "{err}");
     }
 
     fn feed(

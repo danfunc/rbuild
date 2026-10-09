@@ -3,7 +3,7 @@ pub mod updater;
 
 use crate::agent::lock::WorktreeLock;
 use crate::agent::updater::update_agent_binary;
-use crate::protocol::message::{Message, SyncFileChunk};
+use crate::protocol::message::{Message, PATH_PREPEND_ENV, SyncFileChunk};
 use crate::protocol::{read_message, write_message};
 use crate::sync::apply::{apply_deletions, apply_file_chunk};
 use crate::sync::diff::calculate_diff;
@@ -269,11 +269,8 @@ impl AgentSession {
                     }
                 };
 
-                let mut cmd = Command::new(&command);
-                cmd.args(&args).current_dir(&wt);
-                for (k, v) in envs {
-                    cmd.env(k, v);
-                }
+                let mut cmd = remote_command(&command, &wt, &envs);
+                cmd.args(&args);
                 cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
                 let mut child = match cmd.spawn() {
@@ -359,6 +356,7 @@ impl AgentSession {
                 command,
                 targets,
                 flags,
+                envs,
             } => {
                 let wt = match &self.current_worktree {
                     Some(w) => w.clone(),
@@ -374,12 +372,11 @@ impl AgentSession {
                 };
 
                 let bin = command.unwrap_or_else(|| "bazelisk".to_string());
-                let mut cmd = Command::new(&bin);
+                let mut cmd = remote_command(&bin, &wt, &envs);
                 cmd.arg("cquery")
                     .arg("--output=files")
                     .args(&targets)
-                    .args(&flags)
-                    .current_dir(&wt);
+                    .args(&flags);
 
                 let output = match cmd.output() {
                     Ok(out) => out,
@@ -412,27 +409,39 @@ impl AgentSession {
                 let stdout_str = String::from_utf8_lossy(&output.stdout);
                 let mut artifact_count = 0;
 
+                // The Bazel output root is queried at most once, and only if a file lies outside the worktree.
+                let mut output_root: Option<PathBuf> = None;
+                let mut query_output_root = || -> Result<PathBuf> {
+                    if let Some(root) = &output_root {
+                        return Ok(root.clone());
+                    }
+                    let root = query_bazel_output_root(&bin, &wt, &envs)?;
+                    output_root = Some(root.clone());
+                    Ok(root)
+                };
+
                 for line in stdout_str.lines() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
                     }
 
-                    let (rel_path, actual_path) = match resolve_artifact_file(&wt, trimmed) {
-                        Ok(res) => res,
-                        Err(e) => {
-                            let resp = Message::CollectArtifactsResponse {
-                                ok: false,
-                                artifact_count,
-                                error: Some(format!(
-                                    "Failed to resolve artifact '{}': {}",
-                                    trimmed, e
-                                )),
-                            };
-                            write_message(writer, &resp)?;
-                            return Ok(true);
-                        }
-                    };
+                    let (rel_path, actual_path) =
+                        match resolve_artifact_file(&wt, trimmed, &mut query_output_root) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                let resp = Message::CollectArtifactsResponse {
+                                    ok: false,
+                                    artifact_count,
+                                    error: Some(format!(
+                                        "Failed to resolve artifact '{}': {}",
+                                        trimmed, e
+                                    )),
+                                };
+                                write_message(writer, &resp)?;
+                                return Ok(true);
+                            }
+                        };
 
                     if let Err(e) = send_artifact_frames(writer, &rel_path, &actual_path) {
                         let resp = Message::CollectArtifactsResponse {
@@ -592,7 +601,68 @@ pub fn run_agent_loop<R: Read, W: Write>(
     Ok(())
 }
 
-fn resolve_artifact_file(worktree: &Path, raw_path_str: &str) -> Result<(String, PathBuf)> {
+/// Builds a remote command in `cwd`. The reserved PATH-prefix env is applied to the inherited PATH
+/// and is not exported under its own name.
+fn remote_command(program: &str, cwd: &Path, envs: &[(String, String)]) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.current_dir(cwd);
+    for (k, v) in envs {
+        if k != PATH_PREPEND_ENV {
+            cmd.env(k, v);
+        }
+    }
+    if let Some((_, extra)) = envs.iter().find(|(k, _)| k == PATH_PREPEND_ENV) {
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", join_path(extra, &inherited));
+    }
+    cmd
+}
+
+fn join_path(prepend: &str, inherited: &str) -> String {
+    if inherited.is_empty() {
+        prepend.to_string()
+    } else {
+        format!("{prepend}:{inherited}")
+    }
+}
+
+/// Asks Bazel for its `output_path` in the worktree. No local fallback is attempted.
+fn query_bazel_output_root(
+    bin: &str,
+    worktree: &Path,
+    envs: &[(String, String)],
+) -> Result<PathBuf> {
+    let output = remote_command(bin, worktree, envs)
+        .args(["info", "output_path"])
+        .output()
+        .with_context(|| format!("Running '{bin} info output_path'"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        anyhow::bail!(
+            "'{bin} info output_path' exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let root = PathBuf::from(stdout.trim());
+    if !root.is_absolute() {
+        anyhow::bail!(
+            "'{bin} info output_path' did not return an absolute path: '{}'",
+            stdout.trim()
+        );
+    }
+    Ok(root)
+}
+
+/// Maps a cquery output line to a bazel-bin-relative path and the file to send.
+///
+/// The file must resolve inside the canonical worktree, or inside the canonical Bazel output root
+/// that `output_root` supplies (queried only when the file is outside the worktree).
+fn resolve_artifact_file(
+    worktree: &Path,
+    raw_path_str: &str,
+    output_root: &mut dyn FnMut() -> Result<PathBuf>,
+) -> Result<(String, PathBuf)> {
     let clean_str = raw_path_str.trim().trim_start_matches("./");
     if clean_str.is_empty() {
         anyhow::bail!("Empty artifact path in cquery output");
@@ -635,7 +705,7 @@ fn resolve_artifact_file(worktree: &Path, raw_path_str: &str) -> Result<(String,
     };
 
     // Canonicalize check:
-    // Ensure both worktree and actual_path are canonicalized, and actual_path is contained within worktree.
+    // The canonical artifact must lie under the canonical worktree or under the canonical Bazel output root.
     let canonical_worktree = fs::canonicalize(worktree)
         .with_context(|| format!("Canonicalizing worktree '{}'", worktree.display()))?;
     let canonical_actual = fs::canonicalize(&actual_path).with_context(|| {
@@ -645,11 +715,25 @@ fn resolve_artifact_file(worktree: &Path, raw_path_str: &str) -> Result<(String,
         )
     })?;
 
-    if !canonical_actual.starts_with(&canonical_worktree) {
+    if canonical_actual.starts_with(&canonical_worktree) {
+        return Ok((rel_under_bin, actual_path));
+    }
+
+    let root = output_root().with_context(|| {
+        format!(
+            "Artifact path '{}' escapes worktree '{}' and the Bazel output root is unavailable",
+            raw_path_str,
+            worktree.display()
+        )
+    })?;
+    let canonical_root = fs::canonicalize(&root)
+        .with_context(|| format!("Canonicalizing Bazel output root '{}'", root.display()))?;
+    if !canonical_actual.starts_with(&canonical_root) {
         anyhow::bail!(
-            "Artifact path '{}' escapes worktree '{}' (resolved to '{}')",
+            "Artifact path '{}' escapes worktree '{}' and Bazel output root '{}' (resolved to '{}')",
             raw_path_str,
             worktree.display(),
+            canonical_root.display(),
             canonical_actual.display()
         );
     }
@@ -843,6 +927,10 @@ fn create_artifact_chunk(rel_path: &str, actual_path: &Path) -> Result<SyncFileC
 mod tests {
     use super::*;
 
+    fn no_output_root() -> Result<PathBuf> {
+        anyhow::bail!("no Bazel output root in this test")
+    }
+
     #[test]
     fn test_resolve_artifact_file_mapping() {
         let dir = tempfile::tempdir().unwrap();
@@ -854,7 +942,8 @@ mod tests {
         let artifact = bin_dir.join("app");
         fs::write(&artifact, b"binary").unwrap();
 
-        let (rel, path) = resolve_artifact_file(wt, "bazel-bin/pkg/app").unwrap();
+        let (rel, path) =
+            resolve_artifact_file(wt, "bazel-bin/pkg/app", &mut no_output_root).unwrap();
         assert_eq!(rel, "pkg/app");
         assert_eq!(path, artifact);
 
@@ -864,17 +953,61 @@ mod tests {
         let artifact2 = out_dir.join("tool");
         fs::write(&artifact2, b"tool_data").unwrap();
 
-        let (rel2, path2) =
-            resolve_artifact_file(wt, "bazel-out/darwin_arm64-fastbuild/bin/pkg/tool").unwrap();
+        let (rel2, path2) = resolve_artifact_file(
+            wt,
+            "bazel-out/darwin_arm64-fastbuild/bin/pkg/tool",
+            &mut no_output_root,
+        )
+        .unwrap();
         assert_eq!(rel2, "pkg/tool");
         assert_eq!(path2, artifact2);
+    }
+
+    #[test]
+    fn test_resolve_artifact_file_accepts_symlinked_bazel_output_root() {
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt = wt_dir.path();
+        let output_root_dir = tempfile::tempdir().unwrap();
+        let output_root = output_root_dir.path();
+        let built = output_root.join("k8-fastbuild/bin/pkg");
+        fs::create_dir_all(&built).unwrap();
+        fs::write(built.join("app"), b"binary").unwrap();
+        std::os::unix::fs::symlink(output_root, wt.join("bazel-out")).unwrap();
+
+        let mut root = || -> Result<PathBuf> { Ok(output_root.to_path_buf()) };
+        let (rel, path) =
+            resolve_artifact_file(wt, "bazel-out/k8-fastbuild/bin/pkg/app", &mut root).unwrap();
+        assert_eq!(rel, "pkg/app");
+        assert_eq!(path, wt.join("bazel-out/k8-fastbuild/bin/pkg/app"));
+    }
+
+    #[test]
+    fn test_resolve_artifact_file_rejects_symlink_to_unrelated_root() {
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt = wt_dir.path();
+        let unrelated_dir = tempfile::tempdir().unwrap();
+        let unrelated = unrelated_dir.path();
+        fs::create_dir_all(unrelated.join("k8-fastbuild/bin/pkg")).unwrap();
+        fs::write(unrelated.join("k8-fastbuild/bin/pkg/app"), b"binary").unwrap();
+        std::os::unix::fs::symlink(unrelated, wt.join("bazel-out")).unwrap();
+
+        let real_output_dir = tempfile::tempdir().unwrap();
+        let real_output = real_output_dir.path().to_path_buf();
+        let mut root = || -> Result<PathBuf> { Ok(real_output.clone()) };
+        let res = resolve_artifact_file(wt, "bazel-out/k8-fastbuild/bin/pkg/app", &mut root);
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("escapes worktree"),
+            "Error message must indicate escape: {}",
+            err_msg
+        );
     }
 
     #[test]
     fn test_resolve_artifact_file_rejects_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let wt = dir.path();
-        let res = resolve_artifact_file(wt, "bazel-bin/../../../etc/passwd");
+        let res = resolve_artifact_file(wt, "bazel-bin/../../../etc/passwd", &mut no_output_root);
         assert!(
             res.is_err(),
             "Must reject path traversal in artifact output"
@@ -896,7 +1029,7 @@ mod tests {
         let escape_link = bin_pkg.join("leak_link");
         std::os::unix::fs::symlink(&outside_file, &escape_link).unwrap();
 
-        let res = resolve_artifact_file(wt, "bazel-bin/pkg/leak_link");
+        let res = resolve_artifact_file(wt, "bazel-bin/pkg/leak_link", &mut no_output_root);
         assert!(
             res.is_err(),
             "Must reject symlink escaping worktree root in artifact mapping"
