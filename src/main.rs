@@ -4,8 +4,10 @@ use rbuild::agent::run_agent_loop;
 use rbuild::backend::{BackendKind, select_backend};
 use rbuild::cargo_output::{ArtifactSelection, artifact_paths, render_human_output};
 use rbuild::client::ClientSession;
-use rbuild::client::transport::{LocalProcessTransport, SshTransport, Transport};
-use rbuild::config::Config;
+use rbuild::client::transport::{
+    LocalProcessTransport, SshTransport, Transport, build_and_install_native_agent, probe_ssh,
+};
+use rbuild::config::{Config, WorkerConfig, choose_reachable_worker};
 use rbuild::protocol::message::path_prepend_envs;
 use rbuild::sync::manifest::ManifestCache;
 use std::io::Write;
@@ -76,6 +78,9 @@ pub struct Cli {
     #[arg(long, help = "Path to custom configuration file")]
     pub config: Option<PathBuf>,
 
+    #[arg(long, help = "Select a named worker from configuration")]
+    pub worker: Option<String>,
+
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
@@ -94,6 +99,11 @@ pub enum Commands {
         #[arg(long, help = "Path to agent binary to update if version mismatches")]
         bin_path: Option<PathBuf>,
     },
+    /// List configured workers as text or JSON
+    Workers {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -105,6 +115,37 @@ fn main() -> Result<()> {
             let stdout = std::io::stdout();
             run_agent_loop(stdin.lock(), stdout.lock(), base_dir, bin_path)
         }
+        Some(Commands::Workers { json }) => {
+            let cfg = Config::load_or_default(cli.config.as_deref());
+            let workers = cfg.resolved_workers();
+            let default_name = cfg
+                .default_worker
+                .clone()
+                .or_else(|| (workers.len() == 1).then(|| workers[0].name.clone()));
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"default": default_name, "workers": workers} )
+                    )?
+                );
+            } else {
+                for w in workers {
+                    println!(
+                        "{}{}\t{}\t{}",
+                        w.name,
+                        if default_name.as_deref() == Some(&w.name) {
+                            " (default)"
+                        } else {
+                            ""
+                        },
+                        w.transport,
+                        w.remote.as_deref().unwrap_or("")
+                    );
+                }
+            }
+            Ok(())
+        }
         None => run_client(cli),
     }
 }
@@ -112,10 +153,56 @@ fn main() -> Result<()> {
 fn run_client(cli: Cli) -> Result<()> {
     let cfg = Config::load_or_default(cli.config.as_deref());
 
-    let transport_mode = cli.transport.unwrap_or(cfg.transport);
-    let remote = cli.remote.or(cfg.remote);
-    let agent_path = cli.agent_path.unwrap_or(cfg.agent_path);
-    let build_root = cli.build_root.unwrap_or(cfg.build_root);
+    let workers = cfg.resolved_workers();
+    let selected_name = cli
+        .worker
+        .as_deref()
+        .or(cfg.default_worker.as_deref())
+        .or_else(|| (workers.len() == 1).then(|| workers[0].name.as_str()));
+    let selected_worker = selected_name.and_then(|n| workers.iter().find(|w| w.name == n));
+    if !workers.is_empty() && selected_worker.is_none() {
+        anyhow::bail!(
+            "Unknown or unspecified worker; select --worker <name> or configure default_worker"
+        );
+    }
+    let mut selected = selected_worker.cloned().unwrap_or_else(|| WorkerConfig {
+        name: "default".into(),
+        transport: cfg.transport.clone(),
+        remote: cfg.remote.clone(),
+        agent_path: cfg.agent_path.clone(),
+        build_root: cfg.build_root.clone(),
+        backend: cfg.backend.clone(),
+        bazelisk_path: cfg.bazelisk_path.clone(),
+        cargo_path: cfg.cargo_path.clone(),
+        remote_path_entries: cfg.remote_path_entries.clone(),
+    });
+
+    let requested_transport = cli.transport.as_deref().unwrap_or(&selected.transport);
+    if requested_transport == "ssh" && !workers.is_empty() {
+        let start = workers
+            .iter()
+            .position(|w| w.name == selected.name)
+            .unwrap_or(0);
+        match choose_reachable_worker(&workers, start, |worker| {
+            if worker.transport == "local" {
+                return Ok(());
+            }
+            let destination = worker
+                .remote
+                .as_deref()
+                .ok_or_else(|| "missing remote destination".to_string())?;
+            probe_ssh(destination).map_err(|e| format!("{e:#}"))?;
+            Ok(())
+        }) {
+            Ok((index, ())) => selected = workers[index].clone(),
+            Err(failures) => anyhow::bail!("No reachable worker: {}", failures.join("; ")),
+        }
+    }
+
+    let transport_mode = cli.transport.clone().unwrap_or(selected.transport);
+    let remote = cli.remote.or(selected.remote);
+    let agent_path = cli.agent_path.unwrap_or(selected.agent_path);
+    let build_root = cli.build_root.unwrap_or(selected.build_root);
 
     let client_id = cli.client_id.or(cfg.client_id).unwrap_or_else(|| {
         std::env::var("USER")
@@ -134,19 +221,19 @@ fn run_client(cli: Cli) -> Result<()> {
     let worktree_name = cli.worktree.unwrap_or_else(|| "main".to_string());
     let backend = select_backend(
         &current_dir,
-        cli.backend.as_deref().or(cfg.backend.as_deref()),
+        cli.backend.as_deref().or(selected.backend.as_deref()),
     )?;
 
     let path_entries = if cli.remote_path_entry.is_empty() {
-        cfg.remote_path_entries.clone()
+        selected.remote_path_entries.clone()
     } else {
         cli.remote_path_entry.clone()
     };
     let artifact_selection = ArtifactSelection::parse(cli.artifacts.as_deref().unwrap_or("final"))
         .ok_or_else(|| anyhow::anyhow!("Unknown --artifacts value; expected final or all"))?;
     let remote_options = RemoteOptions {
-        bazelisk_path: cli.bazelisk_path.unwrap_or(cfg.bazelisk_path),
-        cargo_path: cli.cargo_path.unwrap_or(cfg.cargo_path),
+        bazelisk_path: cli.bazelisk_path.unwrap_or(selected.bazelisk_path),
+        cargo_path: cli.cargo_path.unwrap_or(selected.cargo_path),
         path_envs: path_prepend_envs(&path_entries),
         artifact_selection,
     };
@@ -182,6 +269,24 @@ fn run_client(cli: Cli) -> Result<()> {
                     "SSH transport requires a remote destination. Specify via --remote or 'remote' in config"
                 )
             })?;
+            let transport = SshTransport::spawn(&dest, &agent_path, Some(&build_root))?;
+            let mut session = ClientSession::new(transport);
+            if let Err(error) = session.handshake(None) {
+                if error
+                    .to_string()
+                    .contains("Cannot self-update cross-platform agent")
+                {
+                    build_and_install_native_agent(
+                        &dest,
+                        &agent_path,
+                        Path::new(env!("CARGO_MANIFEST_DIR")),
+                    )
+                    .context("Building and installing native worker agent")?;
+                } else {
+                    return Err(error);
+                }
+            }
+            drop(session);
             let transport = SshTransport::spawn(&dest, &agent_path, Some(&build_root))?;
             let session = ClientSession::new(transport);
             // In cross-platform environments (e.g. macOS client -> Linux agent), local binary must not be uploaded
@@ -612,5 +717,23 @@ mod tests {
         assert_eq!(cli.build_root.as_deref(), Some("/srv/build"));
         assert_eq!(cli.client_id.as_deref(), Some("mac-client"));
         assert_eq!(cli.bazel_args, vec!["build", "//pkg:target"]);
+    }
+
+    #[test]
+    fn test_cli_parsing_named_worker() {
+        let cli = Cli::try_parse_from([
+            "rbuild",
+            "--worker",
+            "linux",
+            "build",
+            "--config=rp2350",
+            "//firmware:target",
+        ])
+        .unwrap();
+        assert_eq!(cli.worker.as_deref(), Some("linux"));
+        assert_eq!(
+            cli.bazel_args,
+            vec!["build", "--config=rp2350", "//firmware:target"]
+        );
     }
 }

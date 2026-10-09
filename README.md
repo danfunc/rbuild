@@ -4,7 +4,7 @@
 
 ## Transport and configuration
 
-The local test transport launches an agent child process. SSH transport launches the system `ssh` command with `-T -o BatchMode=yes`; it uses the normal OpenSSH configuration and carries protocol frames on stdin/stdout. The agent's stderr is passed through. SSH transport has not yet been validated against a live host.
+The local test transport launches an agent child process. SSH transport launches the system `ssh` command with `-T -o BatchMode=yes`; it uses the normal OpenSSH configuration and carries protocol frames on stdin/stdout. The agent's stderr is passed through. SSH has been exercised against the configured main-lxc worker.
 
 Configure `~/.config/rbuild.toml`:
 
@@ -22,13 +22,47 @@ excludes = ["target/", "build-temp/"]
 artifact_globs = ["out/**/*.bin"] # generic backend; supports *, **, and ?
 ```
 
+For multiple workers, use named `[[workers]]` entries. The selected/default worker is tried
+first; if its SSH connection probe fails, rbuild tries remaining entries in configuration
+order. A build or agent protocol error does not trigger failover. Worker Cargo/Bazelisk paths
+and PATH entries are independent:
+
+```toml
+default_worker = "main-lxc"
+
+[[workers]]
+name = "main-lxc"
+transport = "ssh"
+remote = "ishigakiyua@100.64.0.12"
+agent_path = "/home/ishigakiyua/.local/bin/rbuild"
+build_root = "/srv/build"
+backend = "bazel"
+bazelisk_path = "/home/ishigakiyua/.local/bin/bazelisk"
+remote_path_entries = ["/home/ishigakiyua/.local/bin"]
+
+[[workers]]
+name = "debian-cargo"
+transport = "ssh"
+remote = "builder@example.net"
+agent_path = "/home/builder/.local/bin/rbuild"
+backend = "cargo"
+cargo_path = "/home/builder/.cargo/bin/cargo"
+remote_path_entries = ["/home/builder/.cargo/bin"]
+```
+
+Select with `rbuild --worker debian-cargo build ...`, or inspect with
+`rbuild workers --json`. When a cross-platform agent reports an old protocol, rbuild archives
+its own Rust sources, builds the agent with the worker's native `cargo`, and atomically replaces
+the configured agent path. This uses the worker's platform/toolchain and avoids deploying a
+host-platform executable. It requires Cargo and its dependencies to be available on the worker.
+
 CLI options such as `--transport`, `--remote`, `--agent-path`, `--backend`, `--build-root`, and `--client-id` override settings. `--bazelisk-path`, `--cargo-path`, and `--remote-path-entry` (repeatable) set the remote tools and PATH; a `--remote-path-entry` replaces the configured `remote_path_entries`. `--artifacts final|all` selects Cargo outputs (see below). For example:
 
 ```sh
 rbuild --transport=ssh --remote=user@100.64.0.12 --agent-path=/home/user/.local/bin/rbuild build //pkg:app
 ```
 
-Do not use an SSH alias whose address is stale. The remote agent binary must already exist at `agent_path`; SSH mode does not upload the local client executable. Native-build it on the target or provide a matching platform asset in a later release workflow.
+Do not use an SSH alias whose address is stale. SSH does not upload the local client executable. On a cross-platform protocol mismatch, rbuild builds its own source on the worker and atomically replaces `agent_path`.
 
 ## Backend selection
 
@@ -55,12 +89,12 @@ Workspace enumeration uses `git ls-files -co --exclude-standard`; non-Git source
 Wire compatibility: `PROTOCOL_VERSION` (currently 2) must match exactly on both sides. The agent answers `compatible=false` to any other version, and the client also refuses a `compatible=true` answer that reports a different version. Protocol 2 added `CollectArtifactsRequest.envs` and the reserved `RBUILD_PATH_PREPEND` env key, so an agent on protocol 1 would silently ignore PATH entries. The handshake therefore fails closed in every mismatch case, and no lock or build request is sent.
 
 Mismatch outcomes:
-- Different protocol, different OS/architecture: fails. No binary is sent.
+- Different protocol, different OS/architecture: the worker-native source build updates the agent.
 - Different protocol, same OS/architecture, local binary available (local transport): the client sends its binary and the agent replaces its own file. The session then fails with "reconnect and retry", because the running agent process still has the old code. The next connection starts the new binary.
-- Different protocol, no local binary (SSH transport always): fails. Deploy the agent binary to the remote host first.
+- The worker-native build requires Cargo, a Rust toolchain, and dependency access or cache on the worker.
 - Same protocol, different build ID: accepted. Build IDs differ across macOS and Linux as expected, and do not cause an upload.
 
-SSH sessions never self-update the remote agent from the local executable.
+SSH sessions never send the local executable to the remote agent.
 
 Worktree locks use an atomic `.rbuild.lock` file containing a PID. On Linux, missing `/proc/<pid>` entries are treated as stale; elsewhere `kill -0` checks liveness. PID reuse can keep a stale lock from being recovered. Old worktree retention/cleanup is not implemented.
 
@@ -68,6 +102,6 @@ Worktree locks use an atomic `.rbuild.lock` file containing a PID. On Linux, mis
 
 Implemented: local and SSH transport code, protocol/platform handshake, Git differential sync, Bazel/Cargo/generic backend selection, chunked artifact retrieval, compile database rewriting, debugger mapping, stale-PID lock recovery.
 
-Not yet verified against a live remote host: SSH login/agent startup, native Linux agent deployment, Cargo build/retrieval on Debian, Bazel build/retrieval, second-run differential behavior over SSH, and remote failure exit-code forwarding. Workspace sync chunking, non-Git traversal, worktree garbage collection, and cross-compiled Linux agent packaging remain future work.
+Not yet verified against a live remote host: Cargo build/retrieval on Debian, second-run differential behavior over SSH, and remote failure exit-code forwarding. Workspace sync chunking, non-Git traversal, and worktree garbage collection remain future work.
 
 Local checks: `cargo fmt --check`, `cargo check --all-targets`, and `cargo test`.

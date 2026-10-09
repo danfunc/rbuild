@@ -632,10 +632,23 @@ fn query_bazel_output_root(
     worktree: &Path,
     envs: &[(String, String)],
 ) -> Result<PathBuf> {
+    // Repo-local build rc entries can refer to repositories only materialized under a
+    // particular build configuration. `info` needs no project rc, and must still work
+    // to validate cquery's symlinked output paths.
     let output = remote_command(bin, worktree, envs)
-        .args(["info", "output_path"])
+        .args(["--ignore_all_rc_files", "info", "output_path"])
         .output()
         .with_context(|| format!("Running '{bin} info output_path'"))?;
+    let output = if output.status.success() {
+        output
+    } else {
+        // Keep compatibility with wrappers and older Bazel versions that do not accept
+        // --ignore_all_rc_files; their normal info path may still work.
+        remote_command(bin, worktree, envs)
+            .args(["info", "output_path"])
+            .output()
+            .with_context(|| format!("Retrying '{bin} info output_path'"))?
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         anyhow::bail!(

@@ -2,6 +2,7 @@ use crate::protocol::message::Message;
 use crate::protocol::{read_message, write_message};
 use anyhow::{Context, Result, bail};
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 pub trait Transport {
@@ -110,6 +111,76 @@ pub fn build_ssh_command(destination: &str, agent_bin: &str, base_dir: Option<&s
     let mut cmd = Command::new("ssh");
     cmd.args(args);
     cmd
+}
+
+/// Check SSH reachability without invoking the agent protocol. A nonzero remote `true` is a
+/// connection failure for failover purposes; agent/protocol/build failures happen later.
+pub fn probe_ssh(destination: &str) -> Result<()> {
+    let output = Command::new("ssh")
+        .args([
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            destination,
+            "true",
+        ])
+        .output()
+        .with_context(|| format!("spawning SSH probe for {destination}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "SSH connection probe failed for {destination} ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+/// Build this checkout's agent with the worker's native Cargo, then atomically install it.
+pub fn build_and_install_native_agent(
+    destination: &str,
+    agent_bin: &str,
+    source: &Path,
+) -> Result<()> {
+    let mut tar = Command::new("tar");
+    tar.current_dir(source)
+        .args(["-czf", "-", "--", "Cargo.toml", "Cargo.lock", "src"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut tar = tar.spawn().context("starting source archive")?;
+    let mut ssh = Command::new("ssh");
+    ssh.args(["-T", "-o", "BatchMode=yes", destination]);
+    let script = format!(
+        "set -eu; d=$(mktemp -d); target={}; case \"$target\" in */*) ;; *) target=$(command -v \"$target\") ;; esac; parent=$(dirname \"$target\"); mkdir -p \"$parent\"; tmp=\"$parent/.rbuild-agent.$$\"; trap 'rm -rf \"$d\"; rm -f \"$tmp\"' EXIT; tar -xzf - -C \"$d\"; cargo build --release --manifest-path \"$d/Cargo.toml\"; install -m 755 \"$d/target/release/rbuild\" \"$tmp\"; mv -f \"$tmp\" \"$target\"",
+        shell_quote(agent_bin)
+    );
+    ssh.arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut ssh = ssh
+        .spawn()
+        .context("starting native worker build via SSH")?;
+    let mut archive = tar.stdout.take().expect("tar stdout is piped");
+    let mut remote_stdin = ssh.stdin.take().expect("ssh stdin is piped");
+    std::io::copy(&mut archive, &mut remote_stdin).context("streaming rbuild source to worker")?;
+    drop(archive);
+    drop(remote_stdin);
+    let status = ssh.wait().context("waiting for native worker build")?;
+    let tar_status = match tar.try_wait()? {
+        Some(status) => status,
+        None => {
+            tar.kill().context("stopping source archive process")?;
+            tar.wait()?
+        }
+    };
+    if !status.success() || !tar_status.success() {
+        bail!("native agent build/install failed (ssh={status}, tar={tar_status})");
+    }
+    Ok(())
 }
 
 /// SSH transport that spawns external OpenSSH and multiplexes protocol messages over pipes.
