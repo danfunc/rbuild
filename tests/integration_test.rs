@@ -1071,6 +1071,7 @@ echo "{\"reason\":\"compiler-artifact\",\"filenames\":[\"$(pwd)/target/debug/dem
         .args(["build", "--release"])
         .current_dir(&repo)
         .env("PATH", path)
+        .env("RBUILD_CONFIG", temp.path().join("no-user-config.toml"))
         .output()
         .unwrap();
     assert_eq!(
@@ -1171,6 +1172,10 @@ exit 1
         .arg("//pkg:myapp")
         .current_dir(&repo_dir)
         .env("PATH", &new_path)
+        .env(
+            "RBUILD_CONFIG",
+            temp_root.path().join("no-user-config.toml"),
+        )
         .output()
         .expect("Failed to execute rbuild client");
 
@@ -1278,6 +1283,10 @@ exit 37
         .arg("//pkg:failing")
         .current_dir(&repo_dir)
         .env("PATH", &new_path)
+        .env(
+            "RBUILD_CONFIG",
+            temp_root.path().join("no-user-config.toml"),
+        )
         .output()
         .expect("Failed to execute rbuild client");
 
@@ -1296,4 +1305,81 @@ exit 37
         !repo_dir.join(".rbuild-out").exists(),
         "Artifacts must not be collected on build failure"
     );
+}
+
+#[test]
+fn test_cli_progress_json_reports_sync_build_and_collect() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let repo_dir = temp_root.path().join("repo");
+    let remote_base = temp_root.path().join("remote_base");
+    let fake_bin_dir = temp_root.path().join("fake_bin");
+    fs::create_dir_all(&repo_dir).unwrap();
+    fs::create_dir_all(&remote_base).unwrap();
+    fs::create_dir_all(&fake_bin_dir).unwrap();
+    init_git_repo(&repo_dir);
+    fs::write(repo_dir.join("BUILD"), b"# dummy").unwrap();
+    fs::write(repo_dir.join("app.c"), b"int main() { return 0; }").unwrap();
+    let fake_bazelisk = fake_bin_dir.join("bazelisk");
+    fs::write(
+        &fake_bazelisk,
+        "#!/bin/sh\nif [ \"$1\" = build ]; then mkdir -p bazel-bin/pkg; echo bytes > bazel-bin/pkg/myapp; exit 0; fi\nif [ \"$1\" = cquery ]; then echo bazel-bin/pkg/myapp; exit 0; fi\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_bazelisk, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut exe = std::env::current_exe().unwrap();
+    exe.pop();
+    if exe.file_name().map(|n| n == "deps").unwrap_or(false) {
+        exe.pop();
+    }
+    let rbuild_bin = exe.join("rbuild");
+    if !rbuild_bin.exists() {
+        let status = Command::new("cargo")
+            .args(["build", "--bin", "rbuild"])
+            .status()
+            .expect("cargo build rbuild");
+        assert!(status.success());
+    }
+    let new_path = format!(
+        "{}:{}",
+        fake_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(&rbuild_bin)
+        .arg("--progress=json")
+        .arg("--transport=local")
+        .arg("--build-root")
+        .arg(&remote_base)
+        .arg("build")
+        .arg("//pkg:myapp")
+        .current_dir(&repo_dir)
+        .env("PATH", &new_path)
+        .env(
+            "RBUILD_CONFIG",
+            temp_root.path().join("no-user-config.toml"),
+        )
+        .output()
+        .expect("Failed to execute rbuild client");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+    let events: Vec<serde_json::Value> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|v: &serde_json::Value| v["event"] == "rbuild.progress")
+        .collect();
+    let find = |phase: &str, state: &str| {
+        events
+            .iter()
+            .find(|v| v["phase"] == phase && v["state"] == state)
+            .unwrap_or_else(|| panic!("no {phase}/{state} event in {events:?}"))
+    };
+    let sync_done = find("sync", "done");
+    assert!(sync_done["total_files"].as_u64().unwrap() >= 2);
+    assert_eq!(sync_done["done_files"], sync_done["total_files"]);
+    assert_eq!(sync_done["done_bytes"], sync_done["total_bytes"]);
+    find("build", "start");
+    let collect_done = find("collect", "done");
+    assert_eq!(collect_done["done_files"], 1);
+    assert_eq!(collect_done["done_bytes"], 6);
 }

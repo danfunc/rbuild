@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -45,12 +46,81 @@ pub struct Config {
     pub default_worker: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectConfig {
+    #[serde(default)]
+    pub jobs: BTreeMap<String, JobConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct JobConfig {
+    pub worker: String,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Option<String>,
+}
+
+pub fn job_execution_order(project: &ProjectConfig, name: &str) -> Result<Vec<String>, String> {
+    fn visit(
+        project: &ProjectConfig,
+        name: &str,
+        visiting: &mut Vec<String>,
+        done: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if done.iter().any(|item| item == name) {
+            return Ok(());
+        }
+        if visiting.iter().any(|item| item == name) {
+            return Err(format!(
+                "Job dependency cycle: {} -> {name}",
+                visiting.join(" -> ")
+            ));
+        }
+        let job = project
+            .jobs
+            .get(name)
+            .ok_or_else(|| format!("Undefined job '{name}'"))?;
+        visiting.push(name.to_string());
+        if let Some(dep) = &job.depends_on {
+            visit(project, dep, visiting, done)?;
+        }
+        visiting.pop();
+        done.push(name.to_string());
+        Ok(())
+    }
+    let mut done = Vec::new();
+    visit(project, name, &mut Vec::new(), &mut done)?;
+    Ok(done)
+}
+
+pub fn resolve_job_worker<'a>(
+    job: &JobConfig,
+    workers: &'a [WorkerConfig],
+) -> Result<Option<&'a WorkerConfig>, String> {
+    if job.worker == "local" {
+        return Ok(None);
+    }
+    workers
+        .iter()
+        .find(|worker| worker.name == job.worker)
+        .map(Some)
+        .ok_or_else(|| format!("Undefined worker '{}'", job.worker))
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct WorkerConfig {
     pub name: String,
     #[serde(default = "default_transport")]
     pub transport: String,
     pub remote: Option<String>,
+    pub client_id: Option<String>,
     #[serde(default = "default_agent_path")]
     pub agent_path: String,
     #[serde(default = "default_build_root")]
@@ -115,6 +185,7 @@ impl Config {
                 name: "default".into(),
                 transport: self.transport.clone(),
                 remote: self.remote.clone(),
+                client_id: self.client_id.clone(),
                 agent_path: self.agent_path.clone(),
                 build_root: self.build_root.clone(),
                 backend: self.backend.clone(),
@@ -134,6 +205,7 @@ impl Config {
     pub fn load_or_default(explicit_path: Option<&Path>) -> Self {
         let path = explicit_path
             .map(PathBuf::from)
+            .or_else(|| std::env::var_os("RBUILD_CONFIG").map(PathBuf::from))
             .or_else(Self::default_config_path);
 
         if let Some(p) = path {
@@ -147,6 +219,15 @@ impl Config {
         }
 
         Self::default()
+    }
+}
+
+impl ProjectConfig {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot read project config {}: {e}", path.display()))?;
+        toml::from_str(&contents)
+            .map_err(|e| format!("Invalid project config {}: {e}", path.display()))
     }
 }
 
@@ -240,6 +321,7 @@ remote_path_entries = ["/opt/bazel/bin", "/usr/local/go/bin"]
         assert_eq!(workers[0].name, "default");
         assert_eq!(workers[0].remote.as_deref(), Some("host"));
         assert_eq!(workers[0].agent_path, "/bin/rbuild");
+        assert_eq!(workers[0].client_id, None);
     }
 
     #[test]
@@ -251,6 +333,76 @@ remote_path_entries = ["/opt/bazel/bin", "/usr/local/go/bin"]
             vec!["mac", "linux"]
         );
         assert_eq!(workers[1].backend.as_deref(), Some("bazel"));
+    }
+
+    #[test]
+    fn named_worker_client_id_is_parsed() {
+        let cfg: Config = toml::from_str(
+            "client_id='top-level'\n[[workers]]\nname='mac'\nremote='mac'\nclient_id='macbook'\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.client_id.as_deref(), Some("top-level"));
+        assert_eq!(
+            cfg.resolved_workers()[0].client_id.as_deref(),
+            Some("macbook")
+        );
+    }
+
+    #[test]
+    fn project_and_user_worker_settings_compose_and_jobs_resolve() {
+        let user: Config =
+            toml::from_str("[[workers]]\nname='main-lxc'\nremote='builder'\n").unwrap();
+        let project: ProjectConfig = toml::from_str("[jobs.build]\nworker='main-lxc'\nargs=['build','//x:y']\n[jobs.run]\nworker='local'\ncommand=['flash','out.uf2']\ndepends_on='build'\n").unwrap();
+        let workers = user.resolved_workers();
+        assert_eq!(
+            resolve_job_worker(&project.jobs["build"], &workers)
+                .unwrap()
+                .unwrap()
+                .name,
+            "main-lxc"
+        );
+        assert!(
+            resolve_job_worker(&project.jobs["run"], &workers)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            job_execution_order(&project, "run").unwrap(),
+            vec!["build", "run"]
+        );
+        let bad: ProjectConfig = toml::from_str("[jobs.build]\nworker='missing'\n").unwrap();
+        assert!(
+            resolve_job_worker(&bad.jobs["build"], &workers)
+                .unwrap_err()
+                .contains("Undefined worker 'missing'")
+        );
+    }
+
+    #[test]
+    fn job_without_dep_runs_alone_and_missing_dependency_errors() {
+        let project: ProjectConfig =
+            toml::from_str("[jobs.run]\nworker='local'\ncommand=['true']\n").unwrap();
+        assert_eq!(job_execution_order(&project, "run").unwrap(), vec!["run"]);
+        let broken: ProjectConfig =
+            toml::from_str("[jobs.run]\nworker='local'\ncommand=['true']\ndepends_on='build'\n")
+                .unwrap();
+        assert!(
+            job_execution_order(&broken, "run")
+                .unwrap_err()
+                .contains("Undefined job 'build'")
+        );
+    }
+
+    #[test]
+    fn shizuku_project_example_is_valid_and_runs_build_before_local_run() {
+        let project: ProjectConfig =
+            toml::from_str(include_str!("../examples/shizuku.rbuild.toml")).unwrap();
+        assert_eq!(project.jobs["build"].worker, "main-lxc");
+        assert_eq!(project.jobs["run"].worker, "local");
+        assert_eq!(
+            job_execution_order(&project, "run").unwrap(),
+            vec!["build", "uf2", "run"]
+        );
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub fn collect_repository_files(repo_root: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
         .arg("ls-files")
         .arg("-co")
+        .arg("-z")
         .arg("--exclude-standard")
         .current_dir(repo_root)
         .output()
@@ -68,14 +69,42 @@ pub fn collect_repository_files(repo_root: &Path) -> Result<Vec<String>> {
         );
     }
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let mut list = Vec::new();
-    for line in stdout_str.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            list.push(trimmed.to_string());
-        }
+    let mut list = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect::<Vec<_>>();
+    let staged = Command::new("git")
+        .args(["ls-files", "--stage", "-z"])
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("Failed to inspect git index in {}", repo_root.display()))?;
+    if !staged.status.success() {
+        anyhow::bail!(
+            "Failed to inspect git index in {}: {}",
+            repo_root.display(),
+            String::from_utf8_lossy(&staged.stderr).trim()
+        );
     }
+    let gitlinks = staged
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|record| {
+            let tab = record.iter().position(|byte| *byte == b'\t')?;
+            let metadata = std::str::from_utf8(&record[..tab]).ok()?;
+            (metadata.starts_with("160000 "))
+                .then(|| String::from_utf8_lossy(&record[tab + 1..]).into_owned())
+        })
+        .collect::<std::collections::HashSet<_>>();
+    list.retain(|path| {
+        if gitlinks.contains(path) {
+            eprintln!("rbuild: Warning: skipping Git submodule '{path}' (gitlink)");
+            false
+        } else {
+            true
+        }
+    });
     Ok(list)
 }
 
@@ -110,16 +139,37 @@ pub fn build_manifest(
         let full_path = repo_root.join(&rel_str);
         let meta = match fs::symlink_metadata(&full_path) {
             Ok(m) => m,
-            Err(_) => continue, // Deleted between listing and stat
+            Err(error) => {
+                eprintln!(
+                    "rbuild: Warning: skipping '{}' (cannot inspect: {error})",
+                    full_path.display()
+                );
+                continue;
+            }
         };
 
         let file_type = meta.file_type();
         let is_symlink = file_type.is_symlink();
+        if !is_symlink && !file_type.is_file() {
+            eprintln!(
+                "rbuild: Warning: skipping '{}' (not a regular file)",
+                full_path.display()
+            );
+            continue;
+        }
         let mode = meta.permissions().mode();
 
         let (size, mtime_secs, mtime_nanos, hash, symlink_target) = if is_symlink {
-            let target_path = fs::read_link(&full_path)
-                .with_context(|| format!("Reading symlink target: {}", full_path.display()))?;
+            let target_path = match fs::read_link(&full_path) {
+                Ok(target) => target,
+                Err(error) => {
+                    eprintln!(
+                        "rbuild: Warning: skipping '{}' (cannot read symlink: {error})",
+                        full_path.display()
+                    );
+                    continue;
+                }
+            };
             let target_str = target_path.to_string_lossy().to_string();
             let hash = blake3::hash(target_str.as_bytes()).to_hex().to_string();
             (0u64, 0i64, 0u32, hash, Some(target_str))
@@ -140,11 +190,29 @@ pub fn build_manifest(
                 {
                     cached.blake3_hash.clone()
                 } else {
-                    let content = fs::read(&full_path)?;
+                    let content = match fs::read(&full_path) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            eprintln!(
+                                "rbuild: Warning: skipping '{}' (cannot read: {error})",
+                                full_path.display()
+                            );
+                            continue;
+                        }
+                    };
                     blake3::hash(&content).to_hex().to_string()
                 }
             } else {
-                let content = fs::read(&full_path)?;
+                let content = match fs::read(&full_path) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        eprintln!(
+                            "rbuild: Warning: skipping '{}' (cannot read: {error})",
+                            full_path.display()
+                        );
+                        continue;
+                    }
+                };
                 blake3::hash(&content).to_hex().to_string()
             };
 
@@ -236,6 +304,61 @@ mod tests {
         let sym_entry = entries.iter().find(|e| e.path == "link.txt").unwrap();
         assert!(sym_entry.is_symlink);
         assert_eq!(sym_entry.symlink_target.as_deref(), Some("target.txt"));
+    }
+
+    #[test]
+    fn gitlink_is_skipped_and_directory_entries_do_not_abort_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("kept.txt"), b"keep").unwrap();
+        fs::create_dir_all(dir.path().join("module")).unwrap();
+        fs::write(dir.path().join("module/inside.txt"), b"submodule content").unwrap();
+        let submodule = tempfile::tempdir().unwrap();
+        init_git_repo(submodule.path());
+        fs::write(submodule.path().join("sub.txt"), b"submodule").unwrap();
+        for args in [vec!["add", "sub.txt"], vec!["commit", "-m", "submodule"]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(submodule.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let oid = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(submodule.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let add = Command::new("git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &oid,
+                "module",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(add.success());
+
+        let mut cache = ManifestCache::default();
+        let entries = build_manifest(dir.path(), &mut cache, &[]).unwrap();
+        assert!(entries.iter().any(|entry| entry.path == "kept.txt"));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.path == "module" || entry.path.starts_with("module/"))
+        );
     }
 
     #[test]

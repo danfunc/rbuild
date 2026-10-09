@@ -1,0 +1,21 @@
+# Project job example for github/Shizuku.
+# main-lxc currently lacks /opt/picotool/bin/picotool, so build ELF remotely,
+# convert ELF to UF2 on the local Mac, then flash the locally connected board.
+# Note: once the pico-sdk Bazel picotool fix lands, the build job can produce
+# //firmware:shizuku_uf2 on main-lxc directly (no local uf2 step needed).
+
+[jobs.build]
+worker = "main-lxc"
+backend = "bazel"
+args = ["build", "--config=rp2350", "//firmware:shizuku"]
+artifacts = ["bazel-bin/firmware/shizuku"]
+
+[jobs.uf2]
+worker = "local"
+command = ["/bin/sh", "-c", "picotool uf2 convert -t elf \"$RBUILD_ARTIFACTS_DIR/firmware/shizuku\" \"$RBUILD_ARTIFACTS_DIR/shizuku.uf2\""]
+depends_on = "build"
+
+[jobs.run]
+worker = "local"
+command = ["/bin/sh", "-c", "picotool load -f \"$RBUILD_ARTIFACTS_DIR/shizuku.uf2\""]
+depends_on = "uf2"

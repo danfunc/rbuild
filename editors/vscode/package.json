@@ -1,0 +1,42 @@
+{
+  "name": "rbuild",
+  "displayName": "rbuild",
+  "description": "Run rbuild remote builds and launch a configured debugger.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other", "Debuggers"],
+  "main": "./out/src/extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      { "command": "rbuild.build", "title": "rbuild: Build" },
+      { "command": "rbuild.run", "title": "rbuild: Run" },
+      { "command": "rbuild.debug", "title": "rbuild: Build and Debug" },
+      { "command": "rbuild.cancel", "title": "rbuild: Cancel Build" }
+    ],
+    "keybindings": [
+      { "command": "rbuild.build", "key": "cmd+alt+b", "mac": "cmd+alt+b", "when": "workspaceFolderCount > 0" },
+      { "command": "rbuild.build", "key": "ctrl+alt+b", "mac": "ctrl+alt+b", "when": "workspaceFolderCount > 0" },
+      { "command": "rbuild.run", "key": "cmd+alt+r", "mac": "cmd+alt+r", "when": "workspaceFolderCount > 0" },
+      { "command": "rbuild.run", "key": "ctrl+alt+r", "mac": "ctrl+alt+r", "when": "workspaceFolderCount > 0" },
+      { "command": "rbuild.debug", "key": "cmd+alt+d", "mac": "cmd+alt+d", "when": "workspaceFolderCount > 0" },
+      { "command": "rbuild.debug", "key": "ctrl+alt+d", "mac": "ctrl+alt+d", "when": "workspaceFolderCount > 0" }
+    ],
+    "menus": { "editor/title": [
+      { "command": "rbuild.build", "when": "resourceScheme == file", "group": "navigation" },
+      { "command": "rbuild.run", "when": "resourceScheme == file", "group": "navigation" },
+      { "command": "rbuild.debug", "when": "resourceScheme == file", "group": "navigation" }
+    ] },
+    "configuration": { "title": "rbuild", "properties": {
+      "rbuild.executable": { "type": "string", "default": "rbuild", "description": "Path to the local rbuild executable." },
+      "rbuild.arguments": { "type": "array", "items": { "type": "string" }, "default": ["build"], "description": "Arguments passed to rbuild. Bazel arguments are passed directly; Cargo accepts build followed by Cargo build arguments." },
+      "rbuild.backend": { "type": "string", "enum": ["", "bazel", "cargo", "generic"], "default": "", "description": "Optional backend override." },
+      "rbuild.debug.launchConfiguration": { "type": "string", "default": "", "description": "Name of the existing launch configuration to start after a successful build." },
+      "rbuild.debug.sourceMapProperty": { "type": "string", "enum": ["sourceFileMap", "pathSubstitutions", "none"], "default": "sourceFileMap", "description": "Launch configuration property receiving the rbuild remote to local path map." }
+    } }
+  },
+  "scripts": { "compile": "tsc -p .", "test": "node --test out/test/*.test.js", "vscode:prepublish": "npm run compile" },
+  "devDependencies": { "@types/node": "^20.17.0", "@types/vscode": "^1.85.0", "typescript": "^5.7.2", "vsce": "^2.15.0" }
+}

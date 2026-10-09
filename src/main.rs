@@ -7,7 +7,11 @@ use rbuild::client::ClientSession;
 use rbuild::client::transport::{
     LocalProcessTransport, SshTransport, Transport, build_and_install_native_agent, probe_ssh,
 };
-use rbuild::config::{Config, WorkerConfig, choose_reachable_worker};
+use rbuild::config::{
+    Config, ProjectConfig, WorkerConfig, choose_reachable_worker, job_execution_order,
+    resolve_job_worker,
+};
+use rbuild::progress::{self, Progress};
 use rbuild::protocol::message::path_prepend_envs;
 use rbuild::sync::manifest::ManifestCache;
 use std::io::Write;
@@ -82,6 +86,13 @@ pub struct Cli {
     pub worker: Option<String>,
 
     #[arg(
+        long,
+        value_parser = ["json"],
+        help = "Emit machine-readable progress lines on stderr (must precede other arguments)"
+    )]
+    pub progress: Option<String>,
+
+    #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
         help = "Bazel arguments passed to remote agent"
@@ -104,10 +115,20 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Execute a project job
+    Job { name: String },
+    /// List project jobs
+    Jobs {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.progress.is_some() {
+        progress::enable();
+    }
 
     match cli.command {
         Some(Commands::Agent { base_dir, bin_path }) => {
@@ -146,8 +167,86 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Commands::Jobs { json }) => list_jobs(json),
+        Some(Commands::Job { name }) => run_job(&name),
         None => run_client(cli),
     }
+}
+
+fn project_config() -> Result<ProjectConfig> {
+    let path = std::env::current_dir()?.join("rbuild.toml");
+    if path.exists() {
+        ProjectConfig::load(&path).map_err(anyhow::Error::msg)
+    } else {
+        Ok(ProjectConfig::default())
+    }
+}
+
+fn list_jobs(json: bool) -> Result<()> {
+    let project = project_config()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&project.jobs)?);
+    } else {
+        for name in project.jobs.keys() {
+            println!("{name}");
+        }
+    }
+    Ok(())
+}
+
+fn run_job(name: &str) -> Result<()> {
+    let project = project_config()?;
+    let user = Config::load_or_default(None);
+    let workers = user.resolved_workers();
+    let order = job_execution_order(&project, name).map_err(anyhow::Error::msg)?;
+    let total = order.len();
+    for (index, current) in order.into_iter().enumerate() {
+        progress::emit_job(&current, index, total);
+        let job = &project.jobs[&current];
+        let cwd = std::env::current_dir()?;
+        let artifacts_dir = cwd.join(".rbuild-out");
+        let worker = resolve_job_worker(job, &workers).map_err(anyhow::Error::msg)?;
+        if worker.is_none() {
+            let (program, args) = job
+                .command
+                .split_first()
+                .ok_or_else(|| anyhow::anyhow!("Local job '{name}' requires command"))?;
+            let status = std::process::Command::new(program)
+                .args(args)
+                .current_dir(&cwd)
+                .env("RBUILD_ARTIFACTS_DIR", &artifacts_dir)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("Local job '{name}' failed with {status}");
+            }
+            continue;
+        }
+        if job.args.is_empty() {
+            anyhow::bail!("Remote job '{name}' requires args");
+        }
+        let exe = std::env::current_exe()?;
+        let mut command = std::process::Command::new(exe);
+        if progress::enabled() {
+            command.arg("--progress=json");
+        }
+        command.arg("--worker").arg(&job.worker);
+        if let Some(backend) = &job.backend {
+            command.arg("--backend").arg(backend);
+        }
+        command
+            .args(&job.args)
+            .current_dir(&cwd)
+            .env("RBUILD_ARTIFACTS_DIR", &artifacts_dir);
+        command.env(
+            "RBUILD_JOB_ARTIFACTS",
+            serde_json::to_string(&job.artifacts)?,
+        );
+        let status = command.status()?;
+        if !status.success() {
+            anyhow::bail!("Remote job '{name}' failed with {status}");
+        }
+    }
+    Ok(())
 }
 
 fn run_client(cli: Cli) -> Result<()> {
@@ -169,6 +268,7 @@ fn run_client(cli: Cli) -> Result<()> {
         name: "default".into(),
         transport: cfg.transport.clone(),
         remote: cfg.remote.clone(),
+        client_id: cfg.client_id.clone(),
         agent_path: cfg.agent_path.clone(),
         build_root: cfg.build_root.clone(),
         backend: cfg.backend.clone(),
@@ -204,11 +304,15 @@ fn run_client(cli: Cli) -> Result<()> {
     let agent_path = cli.agent_path.unwrap_or(selected.agent_path);
     let build_root = cli.build_root.unwrap_or(selected.build_root);
 
-    let client_id = cli.client_id.or(cfg.client_id).unwrap_or_else(|| {
-        std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "client".to_string())
-    });
+    let client_id = cli
+        .client_id
+        .or(selected.client_id)
+        .or(cfg.client_id)
+        .unwrap_or_else(|| {
+            std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "client".to_string())
+        });
 
     let current_dir = std::env::current_dir().context("Getting current working directory")?;
     let repo_name = cli.repo.unwrap_or_else(|| {
@@ -331,6 +435,10 @@ fn run_session_workflow<T: Transport>(
     bazel_args: &[String],
     remote: &RemoteOptions,
 ) -> Result<()> {
+    let job_artifacts: Vec<String> = std::env::var("RBUILD_JOB_ARTIFACTS")
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
     // Handshake
     session.handshake(local_exe_for_update)?;
     println!("rbuild: Handshake successful.");
@@ -366,6 +474,7 @@ fn run_session_workflow<T: Transport>(
                 ["build".to_string(), "--message-format=json".to_string()],
             );
             // Cargo's JSON stream is buffered: only its human-readable rendering reaches stdout.
+            progress::emit(&Progress::phase("build", "start"));
             let mut stdout = Vec::new();
             let code = session.run_remote_command_to_writers(
                 &remote.cargo_path,
@@ -386,12 +495,16 @@ fn run_session_workflow<T: Transport>(
                 session.collect_paths(&output, &paths)?;
                 finalize_debug_artifacts(&output, &remote_path, current_dir)?;
             }
+            if !job_artifacts.is_empty() {
+                session.collect_paths(&current_dir.join(".rbuild-out"), &job_artifacts)?;
+            }
             return Ok(());
         }
         if backend == BackendKind::Generic {
             let (program, args) = bazel_args
                 .split_first()
                 .ok_or_else(|| anyhow::anyhow!("Generic backend requires a command"))?;
+            progress::emit(&Progress::phase("build", "start"));
             let code = session.run_remote_command(program, args, &remote.path_envs)?;
             if code != 0 {
                 std::process::exit(code);
@@ -401,6 +514,9 @@ fn run_session_workflow<T: Transport>(
                 session.collect_paths(&out, artifact_globs)?;
                 finalize_debug_artifacts(&out, &remote_path, current_dir)?;
             }
+            if !job_artifacts.is_empty() {
+                session.collect_paths(&current_dir.join(".rbuild-out"), &job_artifacts)?;
+            }
             return Ok(());
         }
         let parsed = parse_bazel_args(bazel_args);
@@ -409,6 +525,7 @@ fn run_session_workflow<T: Transport>(
             "rbuild: Executing remote bazelisk command: {:?}",
             bazel_args
         );
+        progress::emit(&Progress::phase("build", "start"));
         let exit_code =
             session.run_remote_command(&remote.bazelisk_path, bazel_args, &remote.path_envs)?;
         if exit_code != 0 {
@@ -441,6 +558,9 @@ fn run_session_workflow<T: Transport>(
                 println!("rbuild: Successfully collected {} artifact(s).", count);
                 finalize_debug_artifacts(&out_dir, &remote_path, current_dir)?;
             }
+        }
+        if !job_artifacts.is_empty() {
+            session.collect_paths(&current_dir.join(".rbuild-out"), &job_artifacts)?;
         }
     }
 

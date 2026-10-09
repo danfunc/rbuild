@@ -33,7 +33,8 @@ default_worker = "main-lxc"
 [[workers]]
 name = "main-lxc"
 transport = "ssh"
-remote = "ishigakiyua@100.64.0.12"
+remote = "ishigakiyua@main-lxc.private.danfuncl.com"
+client_id = "macbook" # optional; overrides the top-level client_id
 agent_path = "/home/ishigakiyua/.local/bin/rbuild"
 build_root = "/srv/build"
 backend = "bazel"
@@ -56,15 +57,48 @@ its own Rust sources, builds the agent with the worker's native `cargo`, and ato
 the configured agent path. This uses the worker's platform/toolchain and avoids deploying a
 host-platform executable. It requires Cargo and its dependencies to be available on the worker.
 
-CLI options such as `--transport`, `--remote`, `--agent-path`, `--backend`, `--build-root`, and `--client-id` override settings. `--bazelisk-path`, `--cargo-path`, and `--remote-path-entry` (repeatable) set the remote tools and PATH; a `--remote-path-entry` replaces the configured `remote_path_entries`. `--artifacts final|all` selects Cargo outputs (see below). For example:
+CLI options such as `--transport`, `--remote`, `--agent-path`, `--backend`, `--build-root`, and `--client-id` override settings. Client identity precedence is `--client-id`, selected worker's `client_id`, top-level `client_id`, then the local username. `--bazelisk-path`, `--cargo-path`, and `--remote-path-entry` (repeatable) set the remote tools and PATH; a `--remote-path-entry` replaces the configured `remote_path_entries`. `--artifacts final|all` selects Cargo outputs (see below). For example:
 
 ```sh
-rbuild --transport=ssh --remote=user@100.64.0.12 --agent-path=/home/user/.local/bin/rbuild build //pkg:app
+rbuild --transport=ssh --remote=user@main-lxc.private.danfuncl.com --agent-path=/home/user/.local/bin/rbuild build //pkg:app
 ```
 
 Do not use an SSH alias whose address is stale. SSH does not upload the local client executable. On a cross-platform protocol mismatch, rbuild builds its own source on the worker and atomically replaces `agent_path`.
 
+## Machine-readable progress
+
+`rbuild --progress=json ...` (the flag must come first) writes one JSON object per line to stderr, throttled to at most one `progress` line per 100 ms (`start`/`done` lines are never dropped): `{"event":"rbuild.progress","phase":"sync|build|collect","state":"start|progress|done", "done_files":..,"total_files":..,"done_bytes":..,"total_bytes":..}` for transfers (`collect` omits totals, which are unknown in advance) and `{"event":"rbuild.job","name":..,"index":..,"total":..}` at the start of each `rbuild job` stage. Human output is unchanged. The VS Code extension consumes these lines.
+
 ## Backend selection
+
+Configuration is split by purpose. The repository's `rbuild.toml` supplies
+project jobs; `~/.config/rbuild.toml` supplies worker connections and tool
+paths. Worker configuration precedence is `--config`, then `RBUILD_CONFIG`,
+then `~/.config/rbuild.toml`; the project file is always read from the current
+repository. A job's `backend` overrides the selected worker's backend and
+automatic backend selection. Its `worker` chooses a worker from the user
+configuration; `local` is reserved for commands run directly on the client.
+
+```toml
+[jobs.build]
+worker = "main-lxc"
+backend = "bazel"
+args = ["build", "//firmware:shizuku"]
+artifacts = ["bazel-bin/firmware/shizuku"]
+
+[jobs.run]
+worker = "local"
+command = ["/bin/sh", "-c", "picotool load -f \"$RBUILD_ARTIFACTS_DIR/shizuku.uf2\""]
+depends_on = "build"
+```
+
+Run a job with `rbuild job build` or `rbuild job run`; `rbuild jobs --json`
+lists project jobs. Dependencies run first. Local commands receive
+`RBUILD_ARTIFACTS_DIR`, set to the project's `.rbuild-out` directory, so they
+can use files collected by an earlier remote build. Remote build jobs collect
+normal Bazel/Cargo outputs automatically; `artifacts` can add worktree relative
+paths to collect explicitly. Existing `rbuild build ...` commands continue to
+use the worker configuration directly.
 
 An explicit `backend` setting wins. Otherwise `MODULE.bazel`, `WORKSPACE`, or root `BUILD` selects Bazel; `Cargo.toml` selects Cargo; other repositories use the generic command backend.
 
@@ -84,7 +118,7 @@ Unknown Bazel flags whose values cannot be safely separated from target labels c
 
 Frames use a 4-byte big-endian length and a 64 MiB maximum serialized payload. Artifact files are sent as 1 MiB raw chunks, zstd-compressed independently, then checked for offset, length, and BLAKE3 before atomic placement. Workspace sync files still use one frame per file and therefore must fit the frame limit.
 
-Workspace enumeration uses `git ls-files -co --exclude-standard`; non-Git source directories are not supported. It preserves executable bits and symlink entries, rejects path traversal and escaping symlinks, and uses BLAKE3 metadata caching plus whole-file zstd compression. Deleted files are removed from the remote worktree.
+Workspace enumeration uses `git ls-files -co --exclude-standard`; non-Git source directories are not supported. Git submodules (gitlinks) are skipped with a warning. Non-regular entries and entries that cannot be inspected or read are skipped with a path-specific warning. It preserves executable bits and symlink entries, rejects path traversal and escaping symlinks, and uses BLAKE3 metadata caching plus whole-file zstd compression. Deleted files are removed from the remote worktree.
 
 Wire compatibility: `PROTOCOL_VERSION` (currently 2) must match exactly on both sides. The agent answers `compatible=false` to any other version, and the client also refuses a `compatible=true` answer that reports a different version. Protocol 2 added `CollectArtifactsRequest.envs` and the reserved `RBUILD_PATH_PREPEND` env key, so an agent on protocol 1 would silently ignore PATH entries. The handshake therefore fails closed in every mismatch case, and no lock or build request is sent.
 

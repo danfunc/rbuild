@@ -4,6 +4,7 @@ pub mod cargo_output;
 pub mod client;
 pub mod config;
 pub mod debug_map;
+pub mod progress;
 pub mod protocol;
 pub mod sync;
 pub mod version;

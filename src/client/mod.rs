@@ -1,6 +1,7 @@
 pub mod transport;
 
 use crate::client::transport::Transport;
+use crate::progress::{self, Progress};
 use crate::protocol::message::{ManifestEntry, Message, SyncFileChunk};
 use crate::sync::apply::apply_file_chunk;
 use crate::sync::manifest::{ManifestCache, build_manifest};
@@ -17,6 +18,53 @@ pub struct SyncStats {
     pub files_checked: usize,
     pub files_transferred: usize,
     pub files_deleted: usize,
+}
+
+/// Emits `collect` progress while artifacts stream in; totals are not known up front.
+struct CollectProgress {
+    bytes: u64,
+    files: u64,
+    current_len: u64,
+}
+
+impl CollectProgress {
+    fn start() -> Self {
+        progress::emit(&Progress::phase("collect", "start"));
+        Self {
+            bytes: 0,
+            files: 0,
+            current_len: 0,
+        }
+    }
+
+    /// Call with each incoming message before it is handled.
+    fn observe(&mut self, message: &Message) {
+        match message {
+            Message::ArtifactStart { raw_len, .. } => self.current_len = *raw_len,
+            Message::ArtifactEnd { .. } => self.finish_file(self.current_len),
+            Message::ArtifactChunk(chunk) => self.finish_file(chunk.raw_len),
+            _ => {}
+        }
+    }
+
+    fn finish_file(&mut self, len: u64) {
+        self.files += 1;
+        self.bytes += len;
+        progress::emit(&Progress::transfer(
+            "collect", "progress", self.files, None, self.bytes, None,
+        ));
+    }
+
+    fn finish(&self) {
+        progress::emit(&Progress::transfer(
+            "collect",
+            "done",
+            self.files,
+            Some(self.files),
+            self.bytes,
+            Some(self.bytes),
+        ));
+    }
 }
 
 pub struct ClientSession<T: Transport> {
@@ -275,6 +323,21 @@ impl<T: Transport> ClientSession<T> {
         let mut transferred = 0;
         let entry_map: std::collections::HashMap<&str, &ManifestEntry> =
             manifest.iter().map(|e| (e.path.as_str(), e)).collect();
+        let total_files = needed_files.len() as u64;
+        let total_bytes: u64 = needed_files
+            .iter()
+            .filter_map(|p| entry_map.get(p.as_str()))
+            .map(|e| e.size)
+            .sum();
+        let mut done_bytes = 0u64;
+        progress::emit(&Progress::transfer(
+            "sync",
+            "start",
+            0,
+            Some(total_files),
+            0,
+            Some(total_bytes),
+        ));
 
         for rel_path in &needed_files {
             let entry = match entry_map.get(rel_path.as_str()) {
@@ -317,6 +380,15 @@ impl<T: Transport> ClientSession<T> {
             match self.transport.recv()? {
                 Message::SyncFileResponse { ok: true, .. } => {
                     transferred += 1;
+                    done_bytes += entry.size;
+                    progress::emit(&Progress::transfer(
+                        "sync",
+                        "progress",
+                        transferred as u64,
+                        Some(total_files),
+                        done_bytes,
+                        Some(total_bytes),
+                    ));
                 }
                 Message::SyncFileResponse {
                     ok: false, error, ..
@@ -326,6 +398,15 @@ impl<T: Transport> ClientSession<T> {
                 other => bail!("Unexpected response to SyncFileChunk: {:?}", other),
             }
         }
+
+        progress::emit(&Progress::transfer(
+            "sync",
+            "done",
+            transferred as u64,
+            Some(total_files),
+            done_bytes,
+            Some(total_bytes),
+        ));
 
         // Notify sync completion to apply deletions and finalize
         self.transport.send(&Message::SyncCompleteRequest)?;
@@ -442,8 +523,10 @@ impl<T: Transport> ClientSession<T> {
         })?;
         let mut count = 0usize;
         let mut pending = None;
+        let mut transfer = CollectProgress::start();
         loop {
             let message = self.transport.recv()?;
+            transfer.observe(&message);
             let Some(message) =
                 handle_artifact_transfer(output_dir, &mut pending, &mut count, message)?
             else {
@@ -467,6 +550,7 @@ impl<T: Transport> ClientSession<T> {
                             "Artifact count mismatch: received {count}, agent reported {artifact_count}"
                         );
                     }
+                    transfer.finish();
                     return Ok(count);
                 }
                 Message::CollectPathsResponse {
@@ -511,8 +595,10 @@ impl<T: Transport> ClientSession<T> {
 
         let mut collected = 0;
         let mut pending = None;
+        let mut transfer = CollectProgress::start();
         loop {
             let message = self.transport.recv()?;
+            transfer.observe(&message);
             let Some(message) =
                 handle_artifact_transfer(output_dir, &mut pending, &mut collected, message)?
             else {
@@ -540,6 +626,7 @@ impl<T: Transport> ClientSession<T> {
                             artifact_count
                         );
                     }
+                    transfer.finish();
                     return Ok(collected);
                 }
 
