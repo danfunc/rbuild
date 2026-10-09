@@ -416,7 +416,7 @@ exit 1
 }
 
 #[test]
-fn test_artifact_collection_oversized_rejected() {
+fn test_artifact_collection_large_file_is_chunked_and_reassembled() {
     let temp_root = tempfile::tempdir().unwrap();
     let remote_base = temp_root.path().join("srv_build");
     let client_out_dir = temp_root.path().join(".rbuild-out");
@@ -427,12 +427,13 @@ fn test_artifact_collection_oversized_rejected() {
     let wt_str = session.lock_worktree("user1", "myrepo", "main").unwrap();
     let wt = Path::new(&wt_str);
 
-    // Create oversized file on remote agent
+    // Create a file larger than the former whole-frame artifact limit.
     let bin_dir = wt.join("bazel-bin/pkg");
     fs::create_dir_all(&bin_dir).unwrap();
     let huge_file_path = bin_dir.join("huge_output");
     let f = fs::File::create(&huge_file_path).unwrap();
-    f.set_len(rbuild::agent::MAX_ARTIFACT_SIZE + 1024).unwrap();
+    let large_len = 20 * 1024 * 1024 + 123;
+    f.set_len(large_len).unwrap();
 
     // Fake bazelisk returning the oversized artifact
     let fake_bazelisk = wt.join("huge_bazelisk.sh");
@@ -453,19 +454,71 @@ exit 1
         &[],
     );
 
-    assert!(
-        res.is_err(),
-        "Oversized artifact exceeding MAX_ARTIFACT_SIZE must be rejected"
+    assert_eq!(res.unwrap(), 1, "Large artifact must be collected");
+    let local_file = client_out_dir.join("pkg/huge_output");
+    assert_eq!(fs::metadata(&local_file).unwrap().len(), large_len);
+    assert_eq!(
+        blake3::hash(&fs::read(local_file).unwrap()),
+        blake3::hash(&vec![0; large_len as usize])
     );
-    let err_msg = res.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("exceeds maximum supported limit"),
-        "Error message must indicate artifact size limit exceeded: {}",
-        err_msg
+
+    drop(session);
+    let _ = agent_thread.join();
+}
+
+#[test]
+fn test_collect_paths_large_file_is_chunked_and_reassembled() {
+    // Cargo and generic backends use collect_paths, so this covers their >16 MiB path.
+    let temp_root = tempfile::tempdir().unwrap();
+    let remote_base = temp_root.path().join("srv_build");
+    let client_out_dir = temp_root.path().join(".rbuild-out");
+    fs::create_dir_all(&remote_base).unwrap();
+
+    let (mut session, agent_thread) = setup_agent_client_pair(&remote_base);
+    session.handshake(None).unwrap();
+    let wt_str = session.lock_worktree("user1", "myrepo", "main").unwrap();
+    let wt = Path::new(&wt_str);
+
+    let release_dir = wt.join("target/release");
+    fs::create_dir_all(&release_dir).unwrap();
+    let large_len = 20 * 1024 * 1024 + 123;
+    let f = fs::File::create(release_dir.join("app")).unwrap();
+    f.set_len(large_len).unwrap();
+
+    let count = session
+        .collect_paths(&client_out_dir, &["target/release/*".to_string()])
+        .expect("glob-selected large artifact must be collected");
+    assert_eq!(count, 1);
+    let local_file = client_out_dir.join("target/release/app");
+    assert_eq!(fs::metadata(&local_file).unwrap().len(), large_len);
+    assert_eq!(
+        blake3::hash(&fs::read(local_file).unwrap()),
+        blake3::hash(&vec![0; large_len as usize])
     );
+
+    drop(session);
+    let _ = agent_thread.join();
+}
+
+#[test]
+fn test_collect_paths_invalid_pattern_is_reported_not_disconnected() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let remote_base = temp_root.path().join("srv_build");
+    let client_out_dir = temp_root.path().join(".rbuild-out");
+    fs::create_dir_all(&remote_base).unwrap();
+
+    let (mut session, agent_thread) = setup_agent_client_pair(&remote_base);
+    session.handshake(None).unwrap();
+    session.lock_worktree("user1", "myrepo", "main").unwrap();
+
+    // Before the fix the agent loop ended on this error, so the client saw a bare EOF.
+    let err = session
+        .collect_paths(&client_out_dir, &["../*".to_string()])
+        .err()
+        .expect("traversal pattern must be rejected");
     assert!(
-        !client_out_dir.join("pkg/huge_output").exists(),
-        "No oversized artifact should be written to client output directory"
+        err.to_string().contains("Invalid artifact pattern"),
+        "unexpected error: {err}"
     );
 
     drop(session);
@@ -797,6 +850,84 @@ fn test_remote_command_execution() {
 }
 
 #[test]
+fn test_cli_cargo_backend_collects_compiler_artifact() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let remote = temp.path().join("remote");
+    let fake_bin = temp.path().join("bin");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&remote).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(repo.join("src.rs"), "fn main() {}\n").unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&["add", "Cargo.toml", "src.rs"]);
+    git(&["commit", "-m", "init"]);
+
+    let cargo_build = Command::new("cargo")
+        .args(["build", "--bin", "rbuild"])
+        .status()
+        .unwrap();
+    assert!(cargo_build.success());
+
+    let fake_cargo = fake_bin.join("cargo");
+    fs::write(&fake_cargo, r##"#!/bin/sh
+mkdir -p target/debug
+printf 'fake-linux-binary' > target/debug/demo
+echo "{\"reason\":\"compiler-artifact\",\"filenames\":[\"$(pwd)/target/debug/demo\"],\"executable\":\"$(pwd)/target/debug/demo\"}"
+"##).unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut exe = std::env::current_exe().unwrap();
+    exe.pop();
+    if exe.file_name().is_some_and(|n| n == "deps") {
+        exe.pop();
+    }
+    let rbuild = exe.join("rbuild");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(rbuild)
+        .args(["--transport=local", "--backend", "cargo", "--build-root"])
+        .arg(&remote)
+        .args(["build", "--release"])
+        .current_dir(&repo)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Cargo backend must finish successfully: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let artifact = repo.join(".rbuild-out/target/debug/demo");
+    let bytes = fs::read(artifact).unwrap_or_else(|e| {
+        panic!(
+            "artifact missing: {e}; stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(bytes, b"fake-linux-binary");
+    assert!(repo.join(".rbuild-out/rbuild-debug-map.json").exists());
+}
+
+#[test]
 fn test_cli_client_binary_end_to_end_build_and_artifacts() {
     let temp_root = tempfile::tempdir().unwrap();
     let repo_dir = temp_root.path().join("repo");
@@ -931,6 +1062,7 @@ fn test_cli_client_binary_nonzero_exit_status() {
     fs::create_dir_all(&fake_bin_dir).unwrap();
 
     init_git_repo(&repo_dir);
+    fs::write(repo_dir.join("BUILD"), "# fake Bazel workspace marker\n").unwrap();
     fs::write(repo_dir.join("main.c"), b"int main() {}").unwrap();
 
     let run_git = |args: &[&str]| {
@@ -941,7 +1073,7 @@ fn test_cli_client_binary_nonzero_exit_status() {
             .unwrap();
         assert!(status.success());
     };
-    run_git(&["add", "main.c"]);
+    run_git(&["add", "BUILD", "main.c"]);
     run_git(&["commit", "-m", "init"]);
 
     let fake_bazelisk = fake_bin_dir.join("bazelisk");

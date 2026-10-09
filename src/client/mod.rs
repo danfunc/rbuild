@@ -4,10 +4,12 @@ use crate::client::transport::Transport;
 use crate::protocol::message::{ManifestEntry, Message, SyncFileChunk};
 use crate::sync::apply::apply_file_chunk;
 use crate::sync::manifest::{ManifestCache, build_manifest};
+use crate::sync::path_safety::resolve_safe_path;
 use crate::version::{PROTOCOL_VERSION, get_current_build_id};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -21,6 +23,103 @@ pub struct ClientSession<T: Transport> {
     transport: T,
 }
 
+struct ChunkedArtifact {
+    path: String,
+    mode: u32,
+    raw_len: u64,
+    expected_hash: String,
+    written: u64,
+    hasher: blake3::Hasher,
+    temp: tempfile::NamedTempFile,
+    target: std::path::PathBuf,
+}
+
+fn handle_artifact_transfer(
+    output_dir: &Path,
+    pending: &mut Option<ChunkedArtifact>,
+    count: &mut usize,
+    message: Message,
+) -> Result<Option<Message>> {
+    match message {
+        Message::ArtifactStart {
+            path,
+            mode,
+            raw_len,
+            blake3,
+        } => {
+            if pending.is_some() {
+                bail!("Received overlapping artifact transfers");
+            }
+            let target = resolve_safe_path(output_dir, &path)
+                .map_err(|e| anyhow::anyhow!("Unsafe artifact path: {e}"))?;
+            let parent = target
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("Artifact path has no parent"))?;
+            fs::create_dir_all(parent)?;
+            let temp = tempfile::Builder::new()
+                .prefix(".rbuild-artifact-")
+                .tempfile_in(parent)?;
+            *pending = Some(ChunkedArtifact {
+                path,
+                mode,
+                raw_len,
+                expected_hash: blake3,
+                written: 0,
+                hasher: blake3::Hasher::new(),
+                temp,
+                target,
+            });
+            Ok(None)
+        }
+        Message::ArtifactData {
+            path,
+            offset,
+            raw_len,
+            zstd_data,
+        } => {
+            let state = pending
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("ArtifactData received without ArtifactStart"))?;
+            if path != state.path || offset != state.written {
+                bail!("Out-of-order or mismatched artifact chunk for {path}");
+            }
+            let bytes = zstd::decode_all(&zstd_data[..])?;
+            if bytes.len() as u64 != raw_len {
+                bail!("Artifact chunk length mismatch for {path}");
+            }
+            state.temp.write_all(&bytes)?;
+            state.hasher.update(&bytes);
+            state.written += raw_len;
+            if state.written > state.raw_len {
+                bail!("Artifact exceeds declared length: {path}");
+            }
+            Ok(None)
+        }
+        Message::ArtifactEnd { path } => {
+            let state = pending
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("ArtifactEnd received without ArtifactStart"))?;
+            if path != state.path || state.written != state.raw_len {
+                bail!("Artifact transfer incomplete for {path}");
+            }
+            let actual_hash = state.hasher.finalize().to_hex().to_string();
+            if actual_hash != state.expected_hash {
+                bail!("Artifact BLAKE3 mismatch for {path}");
+            }
+            state.temp.as_file().set_len(state.raw_len)?;
+            state.temp.as_file().sync_all()?;
+            fs::set_permissions(state.temp.path(), fs::Permissions::from_mode(state.mode))?;
+            state
+                .temp
+                .persist(&state.target)
+                .with_context(|| format!("Persisting artifact {}", state.path))?;
+            *count += 1;
+            Ok(None)
+        }
+        other => Ok(Some(other)),
+    }
+}
+
 impl<T: Transport> ClientSession<T> {
     pub fn new(transport: T) -> Self {
         Self { transport }
@@ -30,26 +129,54 @@ impl<T: Transport> ClientSession<T> {
         &mut self.transport
     }
 
-    /// Performs handshake, verifying protocol version and build ID.
-    /// If incompatible and local binary is accessible, initiates agent update.
+    /// Performs handshake, verifying protocol version and reporting platform identity.
+    /// If incompatible and on the same platform with local binary accessible, initiates agent update.
+    /// Refuses to send local macOS binary to a Linux agent.
     pub fn handshake(&mut self, local_exe_path: Option<&Path>) -> Result<()> {
         let local_build_id = get_current_build_id();
+        let local_platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+
         self.transport.send(&Message::HandshakeRequest {
             protocol_version: PROTOCOL_VERSION,
             build_id: local_build_id.clone(),
+            platform: Some(local_platform.clone()),
         })?;
 
         match self.transport.recv()? {
             Message::HandshakeResponse {
                 compatible,
+                build_id: remote_build_id,
+                platform: remote_platform,
                 message,
                 ..
             } => {
+                let remote_plat = remote_platform.as_deref().unwrap_or("unknown");
+
                 if compatible {
+                    // Protocol version is compatible.
+                    // Different build IDs across different platforms (e.g. macOS client vs Linux agent) are expected and normal.
+                    if local_build_id != remote_build_id {
+                        eprintln!(
+                            "rbuild: Note: Build ID differs between client ({}) and agent ({}). Remote platform is '{}'. Protocol v{} is compatible.",
+                            local_build_id, remote_build_id, remote_plat, PROTOCOL_VERSION
+                        );
+                    }
                     return Ok(());
                 }
 
-                // If incompatible, attempt self-update if binary is available
+                // If incompatible protocol version, check if self-update is safe and possible
+                if remote_plat != local_platform {
+                    bail!(
+                        "Remote agent is incompatible ({:?}). Cannot self-update cross-platform agent: \
+                        remote platform is '{}' while local host is '{}'. Sending a local binary would corrupt \
+                        the remote host. Please deploy a native-built agent binary on the remote host (e.g. via 'cargo build --release').",
+                        message.unwrap_or_else(|| "Protocol mismatch".to_string()),
+                        remote_plat,
+                        local_platform
+                    );
+                }
+
+                // If on the same platform, attempt self-update if local binary is available
                 if let Some(exe) = local_exe_path {
                     let binary_data = fs::read(exe).with_context(|| {
                         format!(
@@ -256,6 +383,84 @@ impl<T: Transport> ClientSession<T> {
         }
     }
 
+    /// Runs a remote command, forwards output, and returns captured stdout/stderr.
+    pub fn run_remote_command_capture(
+        &mut self,
+        command: &str,
+        args: &[String],
+        envs: &[(String, String)],
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        self.transport.send(&Message::RunCommandRequest {
+            command: command.to_string(),
+            args: args.to_vec(),
+            envs: envs.to_vec(),
+        })?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        loop {
+            match self.transport.recv()? {
+                Message::CommandStdout { data } => {
+                    std::io::stdout().write_all(&data)?;
+                    std::io::stdout().flush()?;
+                    out.extend_from_slice(&data);
+                }
+                Message::CommandStderr { data } => {
+                    std::io::stderr().write_all(&data)?;
+                    std::io::stderr().flush()?;
+                    err.extend_from_slice(&data);
+                }
+                Message::CommandExit { exit_code } => return Ok((exit_code, out, err)),
+                Message::ErrorResponse { code, message } => {
+                    bail!("Agent reported command error [{}]: {}", code, message)
+                }
+                other => bail!("Unexpected response during command execution: {:?}", other),
+            }
+        }
+    }
+
+    /// Copies validated worktree relative paths into the local output directory.
+    pub fn collect_paths(&mut self, output_dir: &Path, paths: &[String]) -> Result<usize> {
+        fs::create_dir_all(output_dir)?;
+        self.transport.send(&Message::CollectPathsRequest {
+            paths: paths.to_vec(),
+        })?;
+        let mut count = 0usize;
+        let mut pending = None;
+        loop {
+            let message = self.transport.recv()?;
+            let Some(message) =
+                handle_artifact_transfer(output_dir, &mut pending, &mut count, message)?
+            else {
+                continue;
+            };
+            match message {
+                Message::ArtifactChunk(chunk) => {
+                    apply_file_chunk(output_dir, &chunk)?;
+                    count += 1;
+                }
+                Message::CollectPathsResponse {
+                    ok: true,
+                    artifact_count,
+                    ..
+                } => {
+                    if pending.is_some() {
+                        bail!("Agent reported success while an artifact transfer was unfinished");
+                    }
+                    if count != artifact_count {
+                        bail!(
+                            "Artifact count mismatch: received {count}, agent reported {artifact_count}"
+                        );
+                    }
+                    return Ok(count);
+                }
+                Message::CollectPathsResponse {
+                    ok: false, error, ..
+                } => bail!("Artifact collection failed: {}", error.unwrap_or_default()),
+                other => bail!("Unexpected response while collecting paths: {:?}", other),
+            }
+        }
+    }
+
     /// Collects build artifacts from remote agent into the specified local directory (e.g. `.rbuild-out`).
     ///
     /// Validates path safety, verifying no files escape the local output directory.
@@ -276,8 +481,15 @@ impl<T: Transport> ClientSession<T> {
         })?;
 
         let mut collected = 0;
+        let mut pending = None;
         loop {
-            match self.transport.recv()? {
+            let message = self.transport.recv()?;
+            let Some(message) =
+                handle_artifact_transfer(output_dir, &mut pending, &mut collected, message)?
+            else {
+                continue;
+            };
+            match message {
                 Message::ArtifactChunk(chunk) => {
                     apply_file_chunk(output_dir, &chunk).with_context(|| {
                         format!("Applying downloaded artifact chunk for '{}'", chunk.path)
@@ -289,6 +501,9 @@ impl<T: Transport> ClientSession<T> {
                     artifact_count,
                     ..
                 } => {
+                    if pending.is_some() {
+                        bail!("Agent reported success while an artifact transfer was unfinished");
+                    }
                     if collected != artifact_count {
                         bail!(
                             "Mismatch between transferred artifact chunks ({}) and server reported count ({})",
@@ -316,5 +531,252 @@ impl<T: Transport> ClientSession<T> {
                 ),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct MockTransport {
+        sent: Vec<Message>,
+        responses: VecDeque<Message>,
+    }
+
+    impl MockTransport {
+        fn new(responses: Vec<Message>) -> Self {
+            Self {
+                sent: Vec::new(),
+                responses: responses.into(),
+            }
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn send(&mut self, msg: &Message) -> Result<()> {
+            self.sent.push(msg.clone());
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Result<Message> {
+            self.responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("No more mock responses"))
+        }
+    }
+
+    #[test]
+    fn test_client_handshake_cross_platform_compatible() {
+        let resp = Message::HandshakeResponse {
+            protocol_version: PROTOCOL_VERSION,
+            build_id: "linux-different-build-id".to_string(),
+            compatible: true,
+            platform: Some("linux-x86_64".to_string()),
+            message: None,
+        };
+
+        let transport = MockTransport::new(vec![resp]);
+        let mut session = ClientSession::new(transport);
+
+        let res = session.handshake(None);
+        assert!(
+            res.is_ok(),
+            "Compatible protocol must succeed across platforms"
+        );
+        assert_eq!(session.transport.sent.len(), 1);
+        match &session.transport.sent[0] {
+            Message::HandshakeRequest {
+                protocol_version,
+                platform,
+                ..
+            } => {
+                assert_eq!(*protocol_version, PROTOCOL_VERSION);
+                assert!(platform.is_some());
+            }
+            other => panic!("Expected HandshakeRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_client_handshake_incompatible_cross_platform_fails_closed() {
+        let resp = Message::HandshakeResponse {
+            protocol_version: PROTOCOL_VERSION + 1,
+            build_id: "linux-build-id".to_string(),
+            compatible: false,
+            platform: Some("different_os-unknown_arch".to_string()),
+            message: Some("Protocol version mismatch".to_string()),
+        };
+
+        let transport = MockTransport::new(vec![resp]);
+        let mut session = ClientSession::new(transport);
+
+        let fake_exe = Path::new("/tmp/fake_macos_binary");
+        let res = session.handshake(Some(fake_exe));
+
+        assert!(
+            res.is_err(),
+            "Must fail closed without sending binary to mismatched OS"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Cannot self-update cross-platform agent"),
+            "Error must explicitly explain cross-platform update refusal: {}",
+            err_msg
+        );
+        // Ensure no update request was sent
+        assert_eq!(
+            session.transport.sent.len(),
+            1,
+            "Must not send UpdateAgentRequest"
+        );
+    }
+
+    fn feed(
+        dir: &Path,
+        pending: &mut Option<ChunkedArtifact>,
+        count: &mut usize,
+        message: Message,
+    ) -> Result<Option<Message>> {
+        handle_artifact_transfer(dir, pending, count, message)
+    }
+
+    fn data_frame(path: &str, offset: u64, bytes: &[u8]) -> Message {
+        Message::ArtifactData {
+            path: path.to_string(),
+            offset,
+            raw_len: bytes.len() as u64,
+            zstd_data: zstd::encode_all(bytes, 3).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_artifact_chunks_reassemble_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"0123456789abcdef";
+        let mut pending = None;
+        let mut count = 0;
+        let start = Message::ArtifactStart {
+            path: "bin/app".to_string(),
+            mode: 0o755,
+            raw_len: data.len() as u64,
+            blake3: blake3::hash(data).to_hex().to_string(),
+        };
+        assert!(
+            feed(dir.path(), &mut pending, &mut count, start)
+                .unwrap()
+                .is_none()
+        );
+        feed(
+            dir.path(),
+            &mut pending,
+            &mut count,
+            data_frame("bin/app", 0, &data[..8]),
+        )
+        .unwrap();
+        feed(
+            dir.path(),
+            &mut pending,
+            &mut count,
+            data_frame("bin/app", 8, &data[8..]),
+        )
+        .unwrap();
+        feed(
+            dir.path(),
+            &mut pending,
+            &mut count,
+            Message::ArtifactEnd {
+                path: "bin/app".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+        assert!(pending.is_none());
+        assert_eq!(fs::read(dir.path().join("bin/app")).unwrap(), data);
+    }
+
+    #[test]
+    fn test_artifact_out_of_order_chunk_rejected_without_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pending = None;
+        let mut count = 0;
+        let start = Message::ArtifactStart {
+            path: "app".to_string(),
+            mode: 0o644,
+            raw_len: 16,
+            blake3: "00".repeat(32),
+        };
+        feed(dir.path(), &mut pending, &mut count, start).unwrap();
+        let err = feed(
+            dir.path(),
+            &mut pending,
+            &mut count,
+            data_frame("app", 4, b"xxxx"),
+        )
+        .err()
+        .expect("gap in offsets must be rejected");
+        assert!(err.to_string().contains("Out-of-order"));
+        assert!(!dir.path().join("app").exists());
+    }
+
+    #[test]
+    fn test_artifact_hash_mismatch_leaves_no_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pending = None;
+        let mut count = 0;
+        let start = Message::ArtifactStart {
+            path: "app".to_string(),
+            mode: 0o644,
+            raw_len: 4,
+            blake3: blake3::hash(b"good").to_hex().to_string(),
+        };
+        feed(dir.path(), &mut pending, &mut count, start).unwrap();
+        feed(
+            dir.path(),
+            &mut pending,
+            &mut count,
+            data_frame("app", 0, b"evil"),
+        )
+        .unwrap();
+        let err = feed(
+            dir.path(),
+            &mut pending,
+            &mut count,
+            Message::ArtifactEnd {
+                path: "app".to_string(),
+            },
+        )
+        .err()
+        .expect("hash mismatch must be rejected");
+        assert!(err.to_string().contains("BLAKE3 mismatch"));
+        assert_eq!(count, 0);
+        assert!(!dir.path().join("app").exists());
+        let leftovers = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 0, "temporary artifact file must be removed");
+    }
+
+    #[test]
+    fn test_artifact_start_rejects_escaping_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pending = None;
+        let mut count = 0;
+        let start = Message::ArtifactStart {
+            path: "../escape".to_string(),
+            mode: 0o644,
+            raw_len: 0,
+            blake3: String::new(),
+        };
+        assert!(feed(dir.path(), &mut pending, &mut count, start).is_err());
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn test_non_artifact_messages_pass_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pending = None;
+        let mut count = 0;
+        let passed = feed(dir.path(), &mut pending, &mut count, Message::Pong).unwrap();
+        assert_eq!(passed, Some(Message::Pong));
     }
 }

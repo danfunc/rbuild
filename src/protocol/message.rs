@@ -41,11 +41,15 @@ pub enum Message {
     HandshakeRequest {
         protocol_version: u32,
         build_id: String,
+        #[serde(default)]
+        platform: Option<String>,
     },
     HandshakeResponse {
         protocol_version: u32,
         build_id: String,
         compatible: bool,
+        #[serde(default)]
+        platform: Option<String>,
         message: Option<String>,
     },
 
@@ -127,6 +131,29 @@ pub enum Message {
         error: Option<String>,
     },
     ArtifactChunk(SyncFileChunk),
+    ArtifactStart {
+        path: String,
+        mode: u32,
+        raw_len: u64,
+        blake3: String,
+    },
+    ArtifactData {
+        path: String,
+        offset: u64,
+        raw_len: u64,
+        zstd_data: Vec<u8>,
+    },
+    ArtifactEnd {
+        path: String,
+    },
+    CollectPathsRequest {
+        paths: Vec<String>,
+    },
+    CollectPathsResponse {
+        ok: bool,
+        artifact_count: usize,
+        error: Option<String>,
+    },
 
     // ---------------- General Error / Ping ----------------
     ErrorResponse {

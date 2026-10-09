@@ -23,10 +23,10 @@ pub struct CacheEntry {
 
 impl ManifestCache {
     pub fn load_from_file(path: &Path) -> Self {
-        if let Ok(bytes) = fs::read(path)
-            && let Ok(cache) = serde_json::from_slice(&bytes)
-        {
-            return cache;
+        if let Ok(bytes) = fs::read(path) {
+            if let Ok(cache) = serde_json::from_slice(&bytes) {
+                return cache;
+            }
         }
 
         Self::default()

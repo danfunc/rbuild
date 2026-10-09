@@ -44,18 +44,26 @@ impl AgentSession {
         match msg {
             Message::HandshakeRequest {
                 protocol_version,
-                build_id,
+                build_id: _remote_build_id,
+                platform: _remote_platform,
             } => {
                 let local_build_id = get_current_build_id();
-                let compatible = protocol_version == PROTOCOL_VERSION && build_id == local_build_id;
+                let local_platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+                // Protocol compatibility is decoupled from build ID.
+                // Legitimate cross-platform agents (e.g. Linux agent vs macOS client) will have different build IDs.
+                let compatible = protocol_version == PROTOCOL_VERSION;
                 let response = Message::HandshakeResponse {
                     protocol_version: PROTOCOL_VERSION,
                     build_id: local_build_id,
                     compatible,
+                    platform: Some(local_platform),
                     message: if compatible {
                         None
                     } else {
-                        Some("Version or build ID mismatch".to_string())
+                        Some(format!(
+                            "Protocol version mismatch: agent expects {}, client offered {}",
+                            PROTOCOL_VERSION, protocol_version
+                        ))
                     },
                 };
                 write_message(writer, &response)?;
@@ -426,42 +434,15 @@ impl AgentSession {
                         }
                     };
 
-                    let chunk = match create_artifact_chunk(&rel_path, &actual_path) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let resp = Message::CollectArtifactsResponse {
-                                ok: false,
-                                artifact_count,
-                                error: Some(format!(
-                                    "Failed to read artifact '{}': {}",
-                                    rel_path, e
-                                )),
-                            };
-                            write_message(writer, &resp)?;
-                            return Ok(true);
-                        }
-                    };
-
-                    let chunk_msg = Message::ArtifactChunk(chunk);
-                    let serialized_len = serde_json::to_vec(&chunk_msg)
-                        .map_err(|e| anyhow::anyhow!("Failed to serialize artifact chunk: {}", e))?
-                        .len() as u64;
-                    if serialized_len > crate::protocol::frame::MAX_FRAME_SIZE as u64 {
+                    if let Err(e) = send_artifact_frames(writer, &rel_path, &actual_path) {
                         let resp = Message::CollectArtifactsResponse {
                             ok: false,
                             artifact_count,
-                            error: Some(format!(
-                                "Artifact '{}' frame payload ({} bytes) exceeds protocol MAX_FRAME_SIZE ({} bytes)",
-                                rel_path,
-                                serialized_len,
-                                crate::protocol::frame::MAX_FRAME_SIZE
-                            )),
+                            error: Some(format!("Failed to send artifact '{}': {}", rel_path, e)),
                         };
                         write_message(writer, &resp)?;
                         return Ok(true);
                     }
-
-                    write_message(writer, &chunk_msg)?;
                     artifact_count += 1;
                 }
 
@@ -470,6 +451,105 @@ impl AgentSession {
                     &Message::CollectArtifactsResponse {
                         ok: true,
                         artifact_count,
+                        error: None,
+                    },
+                )?;
+            }
+
+            Message::CollectPathsRequest { paths } => {
+                let wt = match &self.current_worktree {
+                    Some(w) => w.clone(),
+                    None => {
+                        write_message(
+                            writer,
+                            &Message::CollectPathsResponse {
+                                ok: false,
+                                artifact_count: 0,
+                                error: Some("Worktree lock has not been acquired".to_string()),
+                            },
+                        )?;
+                        return Ok(true);
+                    }
+                };
+                // Report glob/validation failures to the client; a `?` here would end the agent loop.
+                let paths = match expand_artifact_globs(&wt, &paths) {
+                    Ok(paths) => paths,
+                    Err(e) => {
+                        write_message(
+                            writer,
+                            &Message::CollectPathsResponse {
+                                ok: false,
+                                artifact_count: 0,
+                                error: Some(format!("Invalid artifact pattern: {e}")),
+                            },
+                        )?;
+                        return Ok(true);
+                    }
+                };
+                let mut count = 0usize;
+                for rel in paths {
+                    if let Err(e) = is_safe_relative_path(&rel) {
+                        write_message(
+                            writer,
+                            &Message::CollectPathsResponse {
+                                ok: false,
+                                artifact_count: count,
+                                error: Some(format!("Unsafe artifact path '{}': {}", rel, e)),
+                            },
+                        )?;
+                        return Ok(true);
+                    }
+                    let path = wt.join(&rel);
+                    let canonical_root = fs::canonicalize(&wt)?;
+                    let canonical_path = match fs::canonicalize(&path) {
+                        Ok(p) if p.starts_with(&canonical_root) => p,
+                        Ok(_) => {
+                            write_message(
+                                writer,
+                                &Message::CollectPathsResponse {
+                                    ok: false,
+                                    artifact_count: count,
+                                    error: Some(format!(
+                                        "Artifact path '{}' escapes worktree",
+                                        rel
+                                    )),
+                                },
+                            )?;
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            write_message(
+                                writer,
+                                &Message::CollectPathsResponse {
+                                    ok: false,
+                                    artifact_count: count,
+                                    error: Some(format!(
+                                        "Artifact '{}' is unavailable: {}",
+                                        rel, e
+                                    )),
+                                },
+                            )?;
+                            return Ok(true);
+                        }
+                    };
+                    if let Err(e) = send_artifact_frames(writer, &rel, &canonical_path) {
+                        write_message(
+                            writer,
+                            &Message::CollectPathsResponse {
+                                ok: false,
+                                artifact_count: count,
+                                error: Some(e.to_string()),
+                            },
+                        )?;
+                        return Ok(true);
+                    }
+                    count += 1;
+                }
+                write_message(
+                    writer,
+                    &Message::CollectPathsResponse {
+                        ok: true,
+                        artifact_count: count,
                         error: None,
                     },
                 )?;
@@ -511,10 +591,6 @@ pub fn run_agent_loop<R: Read, W: Write>(
 
     Ok(())
 }
-
-/// Maximum supported artifact file size (16 MiB) to ensure single-frame delivery
-/// within the 64 MiB protocol frame limit (considering serde_json byte array expansion).
-pub const MAX_ARTIFACT_SIZE: u64 = 16 * 1024 * 1024;
 
 fn resolve_artifact_file(worktree: &Path, raw_path_str: &str) -> Result<(String, PathBuf)> {
     let clean_str = raw_path_str.trim().trim_start_matches("./");
@@ -581,6 +657,154 @@ fn resolve_artifact_file(worktree: &Path, raw_path_str: &str) -> Result<(String,
     Ok((rel_under_bin, actual_path))
 }
 
+fn send_artifact_frames<W: Write>(
+    writer: &mut W,
+    rel_path: &str,
+    actual_path: &Path,
+) -> Result<()> {
+    let meta = fs::symlink_metadata(actual_path)?;
+    if meta.file_type().is_symlink() {
+        write_message(
+            writer,
+            &Message::ArtifactChunk(create_artifact_chunk(rel_path, actual_path)?),
+        )?;
+        return Ok(());
+    }
+    const CHUNK_BYTES: usize = 1024 * 1024;
+    let mut hasher = blake3::Hasher::new();
+    let mut file = fs::File::open(actual_path)?;
+    let mut buffer = vec![0; CHUNK_BYTES];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    write_message(
+        writer,
+        &Message::ArtifactStart {
+            path: rel_path.to_string(),
+            mode: meta.permissions().mode(),
+            raw_len: meta.len(),
+            blake3: hasher.finalize().to_hex().to_string(),
+        },
+    )?;
+    let mut file = fs::File::open(actual_path)?;
+    let mut offset = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        write_message(
+            writer,
+            &Message::ArtifactData {
+                path: rel_path.to_string(),
+                offset,
+                raw_len: n as u64,
+                zstd_data: zstd::encode_all(&buffer[..n], 3)?,
+            },
+        )?;
+        offset += n as u64;
+    }
+    write_message(
+        writer,
+        &Message::ArtifactEnd {
+            path: rel_path.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn expand_artifact_globs(root: &Path, patterns: &[String]) -> Result<Vec<String>> {
+    if patterns
+        .iter()
+        .all(|p| !p.contains('*') && !p.contains('?'))
+    {
+        for pattern in patterns {
+            is_safe_relative_path(pattern)?;
+        }
+        return Ok(patterns
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect());
+    }
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files)?;
+    files.sort();
+    let mut selected = std::collections::BTreeSet::new();
+    for pattern in patterns {
+        is_safe_relative_path(pattern)?;
+        for path in &files {
+            if glob_match(pattern.as_bytes(), path.as_bytes()) {
+                selected.insert(path.clone());
+            }
+        }
+    }
+    Ok(selected.into_iter().collect())
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            collect_files(root, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel != ".git" && !rel.starts_with(".git/") && !rel.starts_with(".rbuild") {
+                out.push(rel);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn glob_match(pattern: &[u8], value: &[u8]) -> bool {
+    let mut dp = vec![vec![false; value.len() + 1]; pattern.len() + 1];
+    dp[0][0] = true;
+    let mut i = 0;
+    while i < pattern.len() {
+        if pattern[i] == b'*' {
+            let double = i + 1 < pattern.len() && pattern[i + 1] == b'*';
+            let next = i + if double { 2 } else { 1 };
+            for j in 0..=value.len() {
+                if !dp[i][j] {
+                    continue;
+                }
+                dp[next][j] = true;
+                let mut k = j;
+                while k < value.len() && (double || value[k] != b'/') {
+                    k += 1;
+                    dp[next][k] = true;
+                }
+            }
+            i = next;
+            continue;
+        }
+        for j in 0..=value.len() {
+            if !dp[i][j] {
+                continue;
+            }
+            match pattern[i] {
+                b'?' if j < value.len() && value[j] != b'/' => dp[i + 1][j + 1] = true,
+                c if j < value.len() && c == value[j] => dp[i + 1][j + 1] = true,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    dp[pattern.len()][value.len()]
+}
+
 fn create_artifact_chunk(rel_path: &str, actual_path: &Path) -> Result<SyncFileChunk> {
     let meta = fs::symlink_metadata(actual_path)?;
     let is_symlink = meta.file_type().is_symlink();
@@ -599,16 +823,6 @@ fn create_artifact_chunk(rel_path: &str, actual_path: &Path) -> Result<SyncFileC
             zstd_data: Vec::new(),
         })
     } else {
-        let file_len = meta.len();
-        if file_len > MAX_ARTIFACT_SIZE {
-            anyhow::bail!(
-                "Artifact '{}' size ({} bytes) exceeds maximum supported limit ({} bytes)",
-                rel_path,
-                file_len,
-                MAX_ARTIFACT_SIZE
-            );
-        }
-
         let bytes = fs::read(actual_path)?;
         let raw_len = bytes.len() as u64;
         let blake3_hash = blake3::hash(&bytes).to_hex().to_string();
@@ -696,23 +910,78 @@ mod tests {
     }
 
     #[test]
-    fn test_create_artifact_chunk_rejects_oversized_file() {
+    fn generic_glob_matches_nested_artifacts() {
         let dir = tempfile::tempdir().unwrap();
-        let large_file = dir.path().join("large_binary");
-        let file = fs::File::create(&large_file).unwrap();
-        // Allocate 1 byte beyond MAX_ARTIFACT_SIZE
-        file.set_len(MAX_ARTIFACT_SIZE + 1).unwrap();
+        fs::create_dir_all(dir.path().join("target/release/deps")).unwrap();
+        fs::write(dir.path().join("target/release/rbuild"), b"bin").unwrap();
+        fs::write(dir.path().join("target/release/deps/libx.rlib"), b"lib").unwrap();
+        let paths = expand_artifact_globs(dir.path(), &["target/release/**".to_string()]).unwrap();
+        assert!(paths.contains(&"target/release/rbuild".to_string()));
+        assert!(paths.contains(&"target/release/deps/libx.rlib".to_string()));
+    }
 
-        let res = create_artifact_chunk("pkg/large_binary", &large_file);
-        assert!(
-            res.is_err(),
-            "Must reject artifacts exceeding MAX_ARTIFACT_SIZE"
-        );
-        let err_msg = res.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("exceeds maximum supported limit"),
-            "Error message must specify size limit: {}",
-            err_msg
-        );
+    #[test]
+    fn test_handshake_cross_platform_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = AgentSession::new(dir.path().to_path_buf(), None);
+        let mut output = Vec::new();
+
+        // Request with matching protocol version but totally different build ID (cross-platform scenario)
+        let req = Message::HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            build_id: "macos-arm64-different-build-hash".to_string(),
+            platform: Some("macos-aarch64".to_string()),
+        };
+
+        session.handle_message(&mut output, req).unwrap();
+        let mut cursor = std::io::Cursor::new(output);
+        let resp: Message = crate::protocol::read_message(&mut cursor).unwrap().unwrap();
+
+        match resp {
+            Message::HandshakeResponse {
+                compatible,
+                protocol_version,
+                platform,
+                ..
+            } => {
+                assert!(
+                    compatible,
+                    "Protocol must be compatible despite different build IDs"
+                );
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert!(
+                    platform.is_some(),
+                    "Agent platform identity must be reported"
+                );
+            }
+            other => panic!("Expected HandshakeResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handshake_rejects_incompatible_protocol_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = AgentSession::new(dir.path().to_path_buf(), None);
+        let mut output = Vec::new();
+
+        let req = Message::HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION + 999,
+            build_id: "any-build-id".to_string(),
+            platform: Some("linux-x86_64".to_string()),
+        };
+
+        session.handle_message(&mut output, req).unwrap();
+        let mut cursor = std::io::Cursor::new(output);
+        let resp: Message = crate::protocol::read_message(&mut cursor).unwrap().unwrap();
+
+        match resp {
+            Message::HandshakeResponse { compatible, .. } => {
+                assert!(
+                    !compatible,
+                    "Incompatible protocol version must be rejected"
+                );
+            }
+            other => panic!("Expected HandshakeResponse, got {:?}", other),
+        }
     }
 }

@@ -9,11 +9,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// or memory-only environments), it falls back to a deterministic string
 /// based on the crate version and compile-time information.
 pub fn get_current_build_id() -> String {
-    if let Ok(exe_path) = std::env::current_exe()
-        && exe_path.exists()
-        && let Ok(hash) = compute_file_blake3(&exe_path)
-    {
-        return hash;
+    if let Ok(exe_path) = std::env::current_exe() {
+        if exe_path.exists() {
+            if let Ok(hash) = compute_file_blake3(&exe_path) {
+                return hash;
+            }
+        }
     }
 
     format!("{}-dev-fallback", env!("CARGO_PKG_VERSION"))

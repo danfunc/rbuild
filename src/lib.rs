@@ -1,6 +1,8 @@
 pub mod agent;
+pub mod backend;
 pub mod client;
 pub mod config;
+pub mod debug_map;
 pub mod protocol;
 pub mod sync;
 pub mod version;
