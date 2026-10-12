@@ -579,9 +579,15 @@ fn write_fake_bazelisk(
         Some(prefix) => format!("{}:*", prefix.display()),
         None => "*".to_string(),
     };
+    let log_file = dir.join("bazel_calls.log");
     let script = format!(
         r#"#!/bin/sh
-if [ "$1" = "info" ] && [ "$2" = "output_path" ]; then
+echo "CMD: $@" >> "{log}"
+if [ "$1" = "--ignore_all_rc_files" ] && [ "$2" = "info" ]; then
+    echo "{output}"
+    exit 0
+fi
+if [ "$1" = "info" ]; then
     echo "{output}"
     exit 0
 fi
@@ -595,6 +601,7 @@ if [ "$1" = "cquery" ]; then
 fi
 exit 1
 "#,
+        log = log_file.display(),
         output = output_path.display(),
         require = require,
         line = cquery_line,
@@ -648,6 +655,18 @@ fn test_artifact_collection_accepts_symlinked_bazel_output_root() {
         b"built app"
     );
 
+    // Verify info output_path arguments when flags are empty (traditional arguments with no extra flags)
+    let log_file = temp_root.path().join("bazel_calls.log");
+    let log_content = fs::read_to_string(&log_file).unwrap();
+    let info_line = log_content
+        .lines()
+        .find(|line| line.contains("info") && line.contains("output_path"))
+        .expect("info output_path must be called");
+    assert_eq!(
+        info_line, "CMD: --ignore_all_rc_files info output_path",
+        "When flags are empty, info output_path args must be identical to traditional call"
+    );
+
     drop(session);
     let _ = agent_thread.join();
 }
@@ -690,6 +709,63 @@ fn test_artifact_collection_rejects_symlink_to_unrelated_root() {
         "Error must report the escape: {err:#}"
     );
     assert!(!client_out_dir.join("pkg/app").exists());
+
+    drop(session);
+    let _ = agent_thread.join();
+}
+
+#[test]
+fn test_artifact_collection_output_root_query_filters_flags() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let remote_base = temp_root.path().join("srv_build");
+    let client_out_dir = temp_root.path().join(".rbuild-out");
+    let output_root = temp_root.path().join("bazel_output_root");
+    fs::create_dir_all(&remote_base).unwrap();
+    fs::create_dir_all(output_root.join("k8-fastbuild/bin/pkg")).unwrap();
+    fs::write(output_root.join("k8-fastbuild/bin/pkg/app"), b"built app").unwrap();
+
+    let (mut session, agent_thread) = setup_agent_client_pair(&remote_base);
+    session.handshake(None).unwrap();
+    let wt_str = session.lock_worktree("user1", "myrepo", "main").unwrap();
+    let wt = Path::new(&wt_str);
+    std::os::unix::fs::symlink(&output_root, wt.join("bazel-out")).unwrap();
+
+    let fake = write_fake_bazelisk(
+        temp_root.path(),
+        &output_root,
+        "bazel-out/k8-fastbuild/bin/pkg/app",
+        None,
+    );
+
+    let flags = vec![
+        "--config=opt".to_string(),
+        "--override_module=dep_a=/remote/dep_a".to_string(),
+        "--copt=-O2".to_string(),
+        "--override_module=dep_b=/remote/dep_b".to_string(),
+    ];
+
+    let count = session
+        .collect_artifacts_with_envs(
+            &client_out_dir,
+            Some(&fake.to_string_lossy()),
+            &["//pkg:app".to_string()],
+            &flags,
+            &[],
+        )
+        .expect("Artifact under the reported Bazel output root must be accepted");
+
+    assert_eq!(count, 1);
+    let log_file = temp_root.path().join("bazel_calls.log");
+    let log_content = fs::read_to_string(&log_file).unwrap();
+    let info_line = log_content
+        .lines()
+        .find(|line| line.contains("info") && line.contains("output_path"))
+        .expect("info output_path must be called");
+    assert_eq!(
+        info_line,
+        "CMD: --ignore_all_rc_files info --override_module=dep_a=/remote/dep_a --override_module=dep_b=/remote/dep_b output_path",
+        "Only --override_module flags must be passed to info output_path, directly after info"
+    );
 
     drop(session);
     let _ = agent_thread.join();
@@ -1382,4 +1458,317 @@ fn test_cli_progress_json_reports_sync_build_and_collect() {
     let collect_done = find("collect", "done");
     assert_eq!(collect_done["done_files"], 1);
     assert_eq!(collect_done["done_bytes"], 6);
+}
+
+#[test]
+fn test_end_to_end_dependency_sync_and_isolation() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let main_repo = temp_root.path().join("main_repo");
+    let dep_repo = temp_root.path().join("dep_repo");
+    let remote_base = temp_root.path().join("srv_build");
+    fs::create_dir_all(&main_repo).unwrap();
+    fs::create_dir_all(&dep_repo).unwrap();
+    fs::create_dir_all(&remote_base).unwrap();
+
+    // 1. Initialize git repos
+    init_git_repo(&main_repo);
+    init_git_repo(&dep_repo);
+
+    fs::write(main_repo.join("main.c"), b"int main() { return 0; }").unwrap();
+    fs::write(main_repo.join("main_local.txt"), b"local untracked").unwrap();
+
+    let run_git = |repo: &Path, args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    run_git(&main_repo, &["add", "main.c"]);
+    run_git(&main_repo, &["commit", "-m", "init main"]);
+
+    fs::write(dep_repo.join("dep_lib.c"), b"void helper() {}").unwrap();
+    fs::write(dep_repo.join("dep_untracked.txt"), b"dep untracked change").unwrap();
+    run_git(&dep_repo, &["add", "dep_lib.c"]);
+    run_git(&dep_repo, &["commit", "-m", "init dep"]);
+
+    // 2. Setup agent session
+    let (mut session, agent_thread) = setup_agent_client_pair(&remote_base);
+    session.handshake(None).unwrap();
+
+    // 3. Lock and sync dependency first
+    let dep_wt = session
+        .lock_worktree("client1", "dep_repo", "branch_a")
+        .expect("Lock dep worktree");
+    let mut dep_cache = ManifestCache::default();
+    let dep_stats = session
+        .sync_workspace(&dep_repo, &mut dep_cache, &[])
+        .expect("Sync dep workspace");
+    // Committed dep_lib.c and untracked dep_untracked.txt are transferred
+    assert_eq!(dep_stats.files_transferred, 2);
+
+    // 4. Lock and sync main repository second (must be locked last)
+    let main_wt = session
+        .lock_worktree("client1", "main_repo", "branch_a")
+        .expect("Lock main worktree");
+    let mut main_cache = ManifestCache::default();
+    let main_stats = session
+        .sync_workspace(&main_repo, &mut main_cache, &[])
+        .expect("Sync main workspace");
+    assert_eq!(main_stats.files_transferred, 2);
+
+    // 5. Verify worker paths match worker_dep_path
+    let expected_dep_path = rbuild::config::worker_dep_path(
+        remote_base.to_str().unwrap(),
+        "client1",
+        "dep_repo",
+        "branch_a",
+    );
+    let expected_main_path = rbuild::config::worker_dep_path(
+        remote_base.to_str().unwrap(),
+        "client1",
+        "main_repo",
+        "branch_a",
+    );
+    assert_eq!(Path::new(&dep_wt), expected_dep_path);
+    assert_eq!(Path::new(&main_wt), expected_main_path);
+
+    // Verify files on agent
+    assert!(Path::new(&dep_wt).join("dep_lib.c").exists());
+    assert!(Path::new(&dep_wt).join("dep_untracked.txt").exists());
+    assert!(Path::new(&main_wt).join("main.c").exists());
+    assert!(Path::new(&main_wt).join("main_local.txt").exists());
+    assert!(!Path::new(&main_wt).join("dep_lib.c").exists());
+
+    // 6. Verify current_worktree on agent is main_repo
+    let exit_code = session
+        .run_remote_command("test", &["-f".to_string(), "main.c".to_string()], &[])
+        .expect("Remote test main.c exists in current worktree");
+    assert_eq!(exit_code, 0);
+
+    let exit_code_dep = session
+        .run_remote_command("test", &["-f".to_string(), "dep_lib.c".to_string()], &[])
+        .expect("Remote test dep_lib.c in main worktree");
+    assert_ne!(exit_code_dep, 0);
+
+    // 7. Verify accessing dependency via RBUILD_DEP_* environment variable
+    let env_name = rbuild::config::dep_env_var_name("dep_repo");
+    assert_eq!(env_name, "RBUILD_DEP_DEP_REPO");
+    let envs = vec![(env_name, dep_wt.clone())];
+    let exit_code_env = session
+        .run_remote_command(
+            "sh",
+            &[
+                "-c".to_string(),
+                "test -f \"$RBUILD_DEP_DEP_REPO/dep_untracked.txt\"".to_string(),
+            ],
+            &envs,
+        )
+        .expect("Remote check file via RBUILD_DEP_DEP_REPO env");
+    assert_eq!(exit_code_env, 0);
+
+    drop(session);
+    agent_thread.join().unwrap();
+}
+
+#[test]
+fn test_cli_dependency_workspace_sync_and_bazel_overrides() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let main_repo = temp_root.path().join("main_project");
+    let dep_repo = temp_root.path().join("shizuku_dep");
+    let remote_base = temp_root.path().join("remote_base");
+    let fake_bin_dir = temp_root.path().join("fake_bin");
+    fs::create_dir_all(&main_repo).unwrap();
+    fs::create_dir_all(&dep_repo).unwrap();
+    fs::create_dir_all(&remote_base).unwrap();
+    fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    // 1. Initialize git repos
+    init_git_repo(&main_repo);
+    init_git_repo(&dep_repo);
+
+    fs::write(main_repo.join("BUILD"), b"# main build file").unwrap();
+    fs::write(main_repo.join("app.c"), b"int main() { return 0; }").unwrap();
+
+    let run_git = |repo: &Path, args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    run_git(&main_repo, &["add", "BUILD", "app.c"]);
+    run_git(&main_repo, &["commit", "-m", "init main"]);
+
+    // Main rbuild.toml specifying dependency
+    let rbuild_toml = r#"
+[deps.shizuku]
+path = "../shizuku_dep"
+bazel_module = "shizuku"
+"#;
+    fs::write(main_repo.join("rbuild.toml"), rbuild_toml).unwrap();
+
+    fs::write(dep_repo.join("BUILD"), b"# dep build file").unwrap();
+    fs::write(dep_repo.join("lib.c"), b"void dep() {}").unwrap();
+    run_git(&dep_repo, &["add", "BUILD", "lib.c"]);
+    run_git(&dep_repo, &["commit", "-m", "init dep"]);
+    // Untracked file in dep to verify uncommitted changes are synchronized
+    fs::write(
+        dep_repo.join("untracked_in_dep.txt"),
+        b"uncommitted dep content",
+    )
+    .unwrap();
+
+    // 2. Setup fake bazelisk logging its arguments and env vars
+    let log_file = temp_root.path().join("bazel_calls.log");
+    let fake_output_root = temp_root.path().join("fake_output_root");
+    fs::create_dir_all(&fake_output_root).unwrap();
+    let fake_bazelisk = fake_bin_dir.join("bazelisk");
+    let fake_script = format!(
+        r#"#!/bin/sh
+echo "CMD: $@" >> "{log}"
+echo "ENV_SHIZUKU: $RBUILD_DEP_SHIZUKU" >> "{log}"
+if [ "$1" = "build" ]; then
+    mkdir -p "{output_root}/k8-fastbuild/bin/pkg"
+    echo "compiled_output" > "{output_root}/k8-fastbuild/bin/pkg/myapp"
+    chmod 755 "{output_root}/k8-fastbuild/bin/pkg/myapp"
+    ln -sfn "{output_root}" bazel-out
+    exit 0
+elif [ "$1" = "cquery" ]; then
+    echo "bazel-out/k8-fastbuild/bin/pkg/myapp"
+    exit 0
+elif [ "$1" = "--ignore_all_rc_files" ] && [ "$2" = "info" ]; then
+    echo "{output_root}"
+    exit 0
+elif [ "$1" = "info" ]; then
+    echo "{output_root}"
+    exit 0
+fi
+echo "Unknown $1" >&2
+exit 1
+"#,
+        log = log_file.display(),
+        output_root = fake_output_root.display()
+    );
+    fs::write(&fake_bazelisk, fake_script).unwrap();
+    fs::set_permissions(&fake_bazelisk, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Locate rbuild binary
+    let mut exe = std::env::current_exe().unwrap();
+    exe.pop();
+    if exe.file_name().map(|n| n == "deps").unwrap_or(false) {
+        exe.pop();
+    }
+    let rbuild_bin = exe.join("rbuild");
+    if !rbuild_bin.exists() {
+        let status = Command::new("cargo")
+            .args(["build", "--bin", "rbuild"])
+            .status()
+            .expect("cargo build rbuild");
+        assert!(status.success());
+    }
+
+    let new_path = format!(
+        "{}:{}",
+        fake_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // 3. Run rbuild client
+    let output = Command::new(&rbuild_bin)
+        .arg("--transport=local")
+        .arg("--build-root")
+        .arg(&remote_base)
+        .arg("--client-id=test_client")
+        .arg("build")
+        .arg("//pkg:myapp")
+        .current_dir(&main_repo)
+        .env("PATH", &new_path)
+        .env(
+            "RBUILD_CONFIG",
+            temp_root.path().join("no-user-config.toml"),
+        )
+        .output()
+        .expect("Failed to execute rbuild client");
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "rbuild client failed. Stderr: {}\nStdout: {}",
+        stderr_str,
+        stdout_str
+    );
+
+    // 4. Verify artifact downloaded to main_repo
+    assert!(main_repo.join(".rbuild-out/pkg/myapp").exists());
+
+    // 5. Verify dependency worker path and synchronized files
+    let expected_dep_dir = remote_base.join("test_client/shizuku/main");
+    assert!(expected_dep_dir.join("lib.c").exists());
+    assert!(expected_dep_dir.join("untracked_in_dep.txt").exists());
+
+    // Verify main worker path and synchronized files
+    let repo_name = main_repo.file_name().unwrap().to_str().unwrap();
+    let expected_main_dir = remote_base.join(format!("test_client/{}/main", repo_name));
+    assert!(expected_main_dir.join("app.c").exists());
+
+    // 6. Verify dependency manifest cache saved in main_repo/.rbuild/deps/, not in dep_repo
+    assert!(!dep_repo.join(".rbuild").exists());
+    assert!(
+        main_repo
+            .join(".rbuild/deps/shizuku_manifest_cache.json")
+            .exists()
+    );
+
+    // 7. Verify Bazel args log contains --override_module=shizuku=<worker_dep_path>
+    let log_content = fs::read_to_string(&log_file).unwrap();
+    let expected_override_flag =
+        format!("--override_module=shizuku={}", expected_dep_dir.display());
+    assert!(
+        log_content.contains(&expected_override_flag),
+        "Expected override flag '{}' in log:\n{}",
+        expected_override_flag,
+        log_content
+    );
+
+    // Verify cquery command also received the override flag
+    let cquery_line = log_content
+        .lines()
+        .find(|line| line.starts_with("CMD: cquery"))
+        .expect("cquery command executed");
+    assert!(
+        cquery_line.contains(&expected_override_flag),
+        "cquery command must receive override flag. Got: {}",
+        cquery_line
+    );
+
+    // Verify info output_path command also received the override flag right after info
+    let info_line = log_content
+        .lines()
+        .find(|line| line.contains("info") && line.contains("output_path"))
+        .expect("info output_path command executed");
+    assert!(
+        info_line.contains(&expected_override_flag),
+        "info output_path command must receive override flag. Got: {}",
+        info_line
+    );
+    let expected_info_seq = format!("info {} output_path", expected_override_flag);
+    assert!(
+        info_line.contains(&expected_info_seq),
+        "info output_path command must place override flag immediately after info. Got: {}",
+        info_line
+    );
+
+    // 8. Verify environment variable RBUILD_DEP_SHIZUKU was set
+    let expected_env_line = format!("ENV_SHIZUKU: {}", expected_dep_dir.display());
+    assert!(
+        log_content.contains(&expected_env_line),
+        "Expected env line '{}' in log:\n{}",
+        expected_env_line,
+        log_content
+    );
 }

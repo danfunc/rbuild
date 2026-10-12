@@ -21,7 +21,7 @@ pub struct AgentSession {
     pub base_dir: PathBuf,
     pub agent_bin_path: Option<PathBuf>,
     pub current_worktree: Option<PathBuf>,
-    pub active_lock: Option<WorktreeLock>,
+    pub active_locks: Vec<WorktreeLock>,
     pub pending_deletions: Vec<String>,
     pub updated_count: usize,
     pub deleted_count: usize,
@@ -33,7 +33,7 @@ impl AgentSession {
             base_dir,
             agent_bin_path,
             current_worktree: None,
-            active_lock: None,
+            active_locks: Vec::new(),
             pending_deletions: Vec::new(),
             updated_count: 0,
             deleted_count: 0,
@@ -123,7 +123,7 @@ impl AgentSession {
                 match WorktreeLock::acquire(&wt_path) {
                     Ok(lock) => {
                         self.current_worktree = Some(wt_path.clone());
-                        self.active_lock = Some(lock);
+                        self.active_locks.push(lock);
                         let resp = Message::LockWorktreeResponse {
                             ok: true,
                             assigned_path: wt_path.to_string_lossy().to_string(),
@@ -415,7 +415,7 @@ impl AgentSession {
                     if let Some(root) = &output_root {
                         return Ok(root.clone());
                     }
-                    let root = query_bazel_output_root(&bin, &wt, &envs)?;
+                    let root = query_bazel_output_root(&bin, &wt, &flags, &envs)?;
                     output_root = Some(root.clone());
                     Ok(root)
                 };
@@ -630,13 +630,23 @@ fn join_path(prepend: &str, inherited: &str) -> String {
 fn query_bazel_output_root(
     bin: &str,
     worktree: &Path,
+    flags: &[String],
     envs: &[(String, String)],
 ) -> Result<PathBuf> {
+    let override_flags: Vec<&str> = flags
+        .iter()
+        .map(String::as_str)
+        .filter(|f| f.starts_with("--override_module="))
+        .collect();
+
     // Repo-local build rc entries can refer to repositories only materialized under a
     // particular build configuration. `info` needs no project rc, and must still work
     // to validate cquery's symlinked output paths.
-    let output = remote_command(bin, worktree, envs)
-        .args(["--ignore_all_rc_files", "info", "output_path"])
+    let mut cmd1 = remote_command(bin, worktree, envs);
+    cmd1.args(["--ignore_all_rc_files", "info"]);
+    cmd1.args(&override_flags);
+    cmd1.arg("output_path");
+    let output = cmd1
         .output()
         .with_context(|| format!("Running '{bin} info output_path'"))?;
     let output = if output.status.success() {
@@ -644,9 +654,11 @@ fn query_bazel_output_root(
     } else {
         // Keep compatibility with wrappers and older Bazel versions that do not accept
         // --ignore_all_rc_files; their normal info path may still work.
-        remote_command(bin, worktree, envs)
-            .args(["info", "output_path"])
-            .output()
+        let mut cmd2 = remote_command(bin, worktree, envs);
+        cmd2.arg("info");
+        cmd2.args(&override_flags);
+        cmd2.arg("output_path");
+        cmd2.output()
             .with_context(|| format!("Retrying '{bin} info output_path'"))?
     };
     let stdout = String::from_utf8_lossy(&output.stdout);

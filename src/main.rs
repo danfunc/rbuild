@@ -1,19 +1,20 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rbuild::agent::run_agent_loop;
-use rbuild::backend::{BackendKind, select_backend};
+use rbuild::backend::{BackendKind, inject_bazel_override_modules, select_backend};
 use rbuild::cargo_output::{ArtifactSelection, artifact_paths, render_human_output};
 use rbuild::client::ClientSession;
 use rbuild::client::transport::{
     LocalProcessTransport, SshTransport, Transport, build_and_install_native_agent, probe_ssh,
 };
 use rbuild::config::{
-    Config, ProjectConfig, WorkerConfig, choose_reachable_worker, job_execution_order,
-    resolve_job_worker,
+    Config, ProjectConfig, ResolvedDep, WorkerConfig, build_dep_command_envs,
+    choose_reachable_worker, job_execution_order, resolve_and_validate_deps, resolve_job_worker,
 };
 use rbuild::progress::{self, Progress};
 use rbuild::protocol::message::path_prepend_envs;
 use rbuild::sync::manifest::ManifestCache;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -322,6 +323,10 @@ fn run_client(cli: Cli) -> Result<()> {
             .unwrap_or_else(|| "repo".to_string())
     });
 
+    let project = project_config()?;
+    let resolved_deps = resolve_and_validate_deps(&current_dir, &repo_name, &project.deps)
+        .map_err(anyhow::Error::msg)?;
+
     let worktree_name = cli.worktree.unwrap_or_else(|| "main".to_string());
     let backend = select_backend(
         &current_dir,
@@ -347,25 +352,29 @@ fn run_client(cli: Cli) -> Result<()> {
         transport_mode, client_id, repo_name, worktree_name
     );
 
+    let params = SessionWorkflowParams {
+        local_exe_for_update: None,
+        current_dir: &current_dir,
+        client_id: &client_id,
+        repo_name: &repo_name,
+        worktree_name: &worktree_name,
+        resolved_deps: &resolved_deps,
+        excludes: &cfg.excludes,
+        backend,
+        artifact_globs: &cfg.artifact_globs,
+        bazel_args: &cli.bazel_args,
+        remote: &remote_options,
+    };
+
     match transport_mode.as_str() {
         "local" => {
             let current_exe = std::env::current_exe().context("Locating current executable")?;
             let transport =
                 LocalProcessTransport::spawn(&current_exe, Some(Path::new(&build_root)))?;
             let session = ClientSession::new(transport);
-            run_session_workflow(
-                session,
-                Some(&current_exe),
-                &current_dir,
-                &client_id,
-                &repo_name,
-                &worktree_name,
-                &cfg.excludes,
-                backend,
-                &cfg.artifact_globs,
-                &cli.bazel_args,
-                &remote_options,
-            )
+            let mut local_params = params;
+            local_params.local_exe_for_update = Some(&current_exe);
+            run_session_workflow(session, &local_params)
         }
         "ssh" => {
             let dest = remote.ok_or_else(|| {
@@ -394,19 +403,7 @@ fn run_client(cli: Cli) -> Result<()> {
             let transport = SshTransport::spawn(&dest, &agent_path, Some(&build_root))?;
             let session = ClientSession::new(transport);
             // In cross-platform environments (e.g. macOS client -> Linux agent), local binary must not be uploaded
-            run_session_workflow(
-                session,
-                None,
-                &current_dir,
-                &client_id,
-                &repo_name,
-                &worktree_name,
-                &cfg.excludes,
-                backend,
-                &cfg.artifact_globs,
-                &cli.bazel_args,
-                &remote_options,
-            )
+            run_session_workflow(session, &params)
         }
         other => {
             anyhow::bail!("Unsupported transport '{}'. Use 'local' or 'ssh'", other);
@@ -422,37 +419,72 @@ struct RemoteOptions {
     artifact_selection: ArtifactSelection,
 }
 
+#[derive(Clone)]
+struct SessionWorkflowParams<'a> {
+    local_exe_for_update: Option<&'a Path>,
+    current_dir: &'a Path,
+    client_id: &'a str,
+    repo_name: &'a str,
+    worktree_name: &'a str,
+    resolved_deps: &'a [ResolvedDep],
+    excludes: &'a [String],
+    backend: BackendKind,
+    artifact_globs: &'a [String],
+    bazel_args: &'a [String],
+    remote: &'a RemoteOptions,
+}
+
 fn run_session_workflow<T: Transport>(
     mut session: ClientSession<T>,
-    local_exe_for_update: Option<&Path>,
-    current_dir: &Path,
-    client_id: &str,
-    repo_name: &str,
-    worktree_name: &str,
-    excludes: &[String],
-    backend: BackendKind,
-    artifact_globs: &[String],
-    bazel_args: &[String],
-    remote: &RemoteOptions,
+    params: &SessionWorkflowParams,
 ) -> Result<()> {
     let job_artifacts: Vec<String> = std::env::var("RBUILD_JOB_ARTIFACTS")
         .ok()
         .and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or_default();
     // Handshake
-    session.handshake(local_exe_for_update)?;
+    session.handshake(params.local_exe_for_update)?;
     println!("rbuild: Handshake successful.");
 
-    // Lock Worktree
-    let remote_path = session.lock_worktree(client_id, repo_name, worktree_name)?;
+    // Sync dependencies first (if any)
+    let mut dep_remote_paths = Vec::new();
+    for dep in params.resolved_deps {
+        let dep_remote_path =
+            session.lock_worktree(params.client_id, &dep.name, params.worktree_name)?;
+        println!(
+            "rbuild: Dependency '{}' worktree locked at '{}'",
+            dep.name, dep_remote_path
+        );
+        let dep_cache_path = params
+            .current_dir
+            .join(".rbuild")
+            .join("deps")
+            .join(format!("{}_manifest_cache.json", dep.name));
+        if let Some(parent) = dep_cache_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut dep_cache = ManifestCache::load_from_file(&dep_cache_path);
+        println!("rbuild: Synchronizing dependency '{}'...", dep.name);
+        let dep_stats = session.sync_workspace(&dep.local_path, &mut dep_cache, params.excludes)?;
+        let _ = dep_cache.save_to_file(&dep_cache_path);
+        println!(
+            "rbuild: Dependency '{}' sync complete (checked {}, transferred {}, deleted {})",
+            dep.name, dep_stats.files_checked, dep_stats.files_transferred, dep_stats.files_deleted
+        );
+        dep_remote_paths.push((dep, dep_remote_path));
+    }
+
+    // Lock Worktree (Main repository locked last so agent's current_worktree is main)
+    let remote_path =
+        session.lock_worktree(params.client_id, params.repo_name, params.worktree_name)?;
     println!("rbuild: Worktree locked at '{}'", remote_path);
 
-    // Sync
-    let cache_path = current_dir.join(".rbuild/manifest_cache.json");
+    // Sync (Main repository)
+    let cache_path = params.current_dir.join(".rbuild/manifest_cache.json");
     let mut cache = ManifestCache::load_from_file(&cache_path);
 
     println!("rbuild: Synchronizing workspace...");
-    let stats = session.sync_workspace(current_dir, &mut cache, excludes)?;
+    let stats = session.sync_workspace(params.current_dir, &mut cache, params.excludes)?;
     let _ = cache.save_to_file(&cache_path);
 
     println!(
@@ -461,12 +493,18 @@ fn run_session_workflow<T: Transport>(
     );
 
     // If bazel args provided, run on agent (NEVER locally)
-    if !bazel_args.is_empty() {
-        if backend == BackendKind::Cargo {
-            let mut args = if bazel_args.first().is_some_and(|s| s == "build") {
-                bazel_args[1..].to_vec()
+    if !params.bazel_args.is_empty() {
+        let dep_path_pairs: Vec<(&str, &str)> = dep_remote_paths
+            .iter()
+            .map(|(dep, path)| (dep.name.as_str(), path.as_str()))
+            .collect();
+        let command_envs = build_dep_command_envs(&params.remote.path_envs, &dep_path_pairs);
+
+        if params.backend == BackendKind::Cargo {
+            let mut args = if params.bazel_args.first().is_some_and(|s| s == "build") {
+                params.bazel_args[1..].to_vec()
             } else {
-                bazel_args.to_vec()
+                params.bazel_args.to_vec()
             };
             args.retain(|a| !a.starts_with("--message-format="));
             args.splice(
@@ -477,9 +515,9 @@ fn run_session_workflow<T: Transport>(
             progress::emit(&Progress::phase("build", "start"));
             let mut stdout = Vec::new();
             let code = session.run_remote_command_to_writers(
-                &remote.cargo_path,
+                &params.remote.cargo_path,
                 &args,
-                &remote.path_envs,
+                &command_envs,
                 &mut stdout,
                 &mut std::io::stderr(),
             )?;
@@ -488,46 +526,65 @@ fn run_session_workflow<T: Transport>(
             if code != 0 {
                 std::process::exit(code);
             }
-            let paths = artifact_paths(&stdout, Path::new(&remote_path), remote.artifact_selection);
+            let paths = artifact_paths(
+                &stdout,
+                Path::new(&remote_path),
+                params.remote.artifact_selection,
+            );
             println!("rbuild: Cargo reported {} artifact path(s).", paths.len());
             if !paths.is_empty() {
-                let output = current_dir.join(".rbuild-out");
+                let output = params.current_dir.join(".rbuild-out");
                 session.collect_paths(&output, &paths)?;
-                finalize_debug_artifacts(&output, &remote_path, current_dir)?;
+                finalize_debug_artifacts(&output, &remote_path, params.current_dir)?;
             }
             if !job_artifacts.is_empty() {
-                session.collect_paths(&current_dir.join(".rbuild-out"), &job_artifacts)?;
+                session.collect_paths(&params.current_dir.join(".rbuild-out"), &job_artifacts)?;
             }
             return Ok(());
         }
-        if backend == BackendKind::Generic {
-            let (program, args) = bazel_args
+        if params.backend == BackendKind::Generic {
+            let (program, args) = params
+                .bazel_args
                 .split_first()
                 .ok_or_else(|| anyhow::anyhow!("Generic backend requires a command"))?;
             progress::emit(&Progress::phase("build", "start"));
-            let code = session.run_remote_command(program, args, &remote.path_envs)?;
+            let code = session.run_remote_command(program, args, &command_envs)?;
             if code != 0 {
                 std::process::exit(code);
             }
-            if !artifact_globs.is_empty() {
-                let out = current_dir.join(".rbuild-out");
-                session.collect_paths(&out, artifact_globs)?;
-                finalize_debug_artifacts(&out, &remote_path, current_dir)?;
+            if !params.artifact_globs.is_empty() {
+                let out = params.current_dir.join(".rbuild-out");
+                session.collect_paths(&out, params.artifact_globs)?;
+                finalize_debug_artifacts(&out, &remote_path, params.current_dir)?;
             }
             if !job_artifacts.is_empty() {
-                session.collect_paths(&current_dir.join(".rbuild-out"), &job_artifacts)?;
+                session.collect_paths(&params.current_dir.join(".rbuild-out"), &job_artifacts)?;
             }
             return Ok(());
         }
-        let parsed = parse_bazel_args(bazel_args);
+
+        let bazel_module_overrides: Vec<(&str, &str)> = dep_remote_paths
+            .iter()
+            .filter_map(|(dep, path)| {
+                dep.bazel_module
+                    .as_deref()
+                    .map(|module| (module, path.as_str()))
+            })
+            .collect();
+        let effective_bazel_args =
+            inject_bazel_override_modules(params.bazel_args, &bazel_module_overrides);
+        let parsed = parse_bazel_args(&effective_bazel_args);
 
         println!(
             "rbuild: Executing remote bazelisk command: {:?}",
-            bazel_args
+            effective_bazel_args
         );
         progress::emit(&Progress::phase("build", "start"));
-        let exit_code =
-            session.run_remote_command(&remote.bazelisk_path, bazel_args, &remote.path_envs)?;
+        let exit_code = session.run_remote_command(
+            &params.remote.bazelisk_path,
+            &effective_bazel_args,
+            &command_envs,
+        )?;
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
@@ -543,24 +600,24 @@ fn run_session_workflow<T: Transport>(
                     "rbuild: Skipping artifact collection: no explicit build targets specified."
                 );
             } else {
-                let out_dir = current_dir.join(".rbuild-out");
+                let out_dir = params.current_dir.join(".rbuild-out");
                 println!(
                     "rbuild: Collecting build artifacts into '{}'...",
                     out_dir.display()
                 );
                 let count = session.collect_artifacts_with_envs(
                     &out_dir,
-                    Some(&remote.bazelisk_path),
+                    Some(&params.remote.bazelisk_path),
                     &parsed.targets,
                     &parsed.flags,
-                    &remote.path_envs,
+                    &command_envs,
                 )?;
                 println!("rbuild: Successfully collected {} artifact(s).", count);
-                finalize_debug_artifacts(&out_dir, &remote_path, current_dir)?;
+                finalize_debug_artifacts(&out_dir, &remote_path, params.current_dir)?;
             }
         }
         if !job_artifacts.is_empty() {
-            session.collect_paths(&current_dir.join(".rbuild-out"), &job_artifacts)?;
+            session.collect_paths(&params.current_dir.join(".rbuild-out"), &job_artifacts)?;
         }
     }
 
@@ -855,5 +912,32 @@ mod tests {
             cli.bazel_args,
             vec!["build", "--config=rp2350", "//firmware:target"]
         );
+    }
+
+    #[test]
+    fn test_parse_bazel_args_preserves_injected_override_modules() {
+        let raw_args = vec![
+            "build".to_string(),
+            "--config=rp2350".to_string(),
+            "//firmware:target".to_string(),
+        ];
+        let overrides = [
+            ("shizuku", "/srv/build/user/shizuku/main"),
+            ("pico_sdk", "/srv/build/user/pico_sdk/main"),
+        ];
+        let injected = inject_bazel_override_modules(&raw_args, &overrides);
+        let parsed = parse_bazel_args(&injected);
+
+        assert_eq!(parsed.subcommand.as_deref(), Some("build"));
+        assert_eq!(parsed.targets, vec!["//firmware:target"]);
+        assert_eq!(
+            parsed.flags,
+            vec![
+                "--override_module=shizuku=/srv/build/user/shizuku/main",
+                "--override_module=pico_sdk=/srv/build/user/pico_sdk/main",
+                "--config=rp2350",
+            ]
+        );
+        assert!(!parsed.is_ambiguous);
     }
 }

@@ -114,13 +114,29 @@ Build artifacts are placed under `.rbuild-out/`. `compile_commands.json` there h
 
 Unknown Bazel flags whose values cannot be safely separated from target labels cause artifact collection to be skipped with a warning. The build command itself still receives its original arguments.
 
+## Dependency repositories (`[deps.*]`)
+
+For multi-repository setups, project dependencies can be declared in the repository's `rbuild.toml`:
+
+```toml
+[deps.shizuku]
+path = "../Shizuku-v3"
+bazel_module = "shizuku"
+```
+
+- **Synchronization**: Each declared dependency is synchronized to the remote worker (`<build_root>/<client_id>/<dep_name>/<worktree_name>`) prior to synchronizing the main repository. Both committed and uncommitted/untracked changes are transferred.
+- **Manifest cache isolation**: Dependency manifest caches are stored inside the main project at `.rbuild/deps/<dep_name>_manifest_cache.json`, leaving dependency working trees untouched.
+- **Bazel module override**: If `bazel_module` is set, `rbuild` automatically appends `--override_module=<bazel_module>=<worker_path>` immediately after the Bazel subcommand for both build execution and artifact cquery resolution. This avoids depending on local `.bazelrc.user` configurations that are not present on remote workers.
+- **Environment variables**: For all backends (Bazel, Cargo, and generic), the worker-side path is passed via environment variables named `RBUILD_DEP_<NAME>` (normalized to uppercase with non-alphanumeric characters replaced with `_`).
+
+
 ## Protocol and filesystem behavior
 
 Frames use a 4-byte big-endian length and a 64 MiB maximum serialized payload. Artifact files are sent as 1 MiB raw chunks, zstd-compressed independently, then checked for offset, length, and BLAKE3 before atomic placement. Workspace sync files still use one frame per file and therefore must fit the frame limit.
 
 Workspace enumeration uses `git ls-files -co --exclude-standard`; non-Git source directories are not supported. Git submodules (gitlinks) are skipped with a warning. Non-regular entries and entries that cannot be inspected or read are skipped with a path-specific warning. It preserves executable bits and symlink entries, rejects path traversal and escaping symlinks, and uses BLAKE3 metadata caching plus whole-file zstd compression. Deleted files are removed from the remote worktree.
 
-Wire compatibility: `PROTOCOL_VERSION` (currently 2) must match exactly on both sides. The agent answers `compatible=false` to any other version, and the client also refuses a `compatible=true` answer that reports a different version. Protocol 2 added `CollectArtifactsRequest.envs` and the reserved `RBUILD_PATH_PREPEND` env key, so an agent on protocol 1 would silently ignore PATH entries. The handshake therefore fails closed in every mismatch case, and no lock or build request is sent.
+Wire compatibility: `PROTOCOL_VERSION` (currently 3) must match exactly on both sides. The agent answers `compatible=false` to any other version, and the client also refuses a `compatible=true` answer that reports a different version. Protocol 2 added `CollectArtifactsRequest.envs` and the reserved `RBUILD_PATH_PREPEND` env key, so an agent on protocol 1 would silently ignore PATH entries. Protocol 3: artifact output-root query receives `--override_module` flags. The handshake therefore fails closed in every mismatch case, and no lock or build request is sent.
 
 Mismatch outcomes:
 - Different protocol, different OS/architecture: the worker-native source build updates the agent.

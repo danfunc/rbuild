@@ -3,7 +3,8 @@ use std::path::Path;
 /// Wire protocol version. Bump on any change to message layout or meaning.
 ///
 /// 2: `CollectArtifactsRequest.envs` and the reserved `RBUILD_PATH_PREPEND` env key.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// 3: artifact output-root query receives `--override_module` flags.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Returns the build ID of the current binary or environment.
 ///

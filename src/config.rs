@@ -1,3 +1,4 @@
+use crate::sync::path_safety::is_safe_relative_path;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -50,6 +51,160 @@ pub struct Config {
 pub struct ProjectConfig {
     #[serde(default)]
     pub jobs: BTreeMap<String, JobConfig>,
+    #[serde(default)]
+    pub deps: BTreeMap<String, DepConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DepConfig {
+    pub path: String,
+    #[serde(default)]
+    pub bazel_module: Option<String>,
+}
+
+/// Transforms dependency name to environment variable name:
+/// `RBUILD_DEP_<NAME>` (NAME is capitalized and non-alphanumeric chars become '_').
+pub fn dep_env_var_name(dep_name: &str) -> String {
+    let sanitized: String = dep_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("RBUILD_DEP_{}", sanitized)
+}
+
+/// Validates that a dependency name does not conflict with the main repository name,
+/// reserved keywords, or contain unsafe path characters.
+pub fn validate_dep_name(dep_name: &str, repo_name: &str) -> Result<(), String> {
+    let trimmed = dep_name.trim();
+    if trimmed.is_empty() {
+        return Err("Dependency name cannot be empty".to_string());
+    }
+    if dep_name != trimmed {
+        return Err(format!(
+            "Dependency name '{}' contains leading or trailing whitespace",
+            dep_name
+        ));
+    }
+    if dep_name == repo_name {
+        return Err(format!(
+            "Dependency name '{}' conflicts with repository name '{}'",
+            dep_name, repo_name
+        ));
+    }
+    if matches!(
+        dep_name,
+        "local" | "." | ".." | ".git" | ".rbuild" | "agent"
+    ) {
+        return Err(format!("Dependency name '{}' is a reserved name", dep_name));
+    }
+    if dep_name.contains('/') || dep_name.contains('\\') || is_safe_relative_path(dep_name).is_err()
+    {
+        return Err(format!(
+            "Dependency name '{}' is invalid: must be a safe single path component without separators",
+            dep_name
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves dependency local path relative to `project_root` (or absolute),
+/// verifying that it exists, is a directory, and is a git repository.
+pub fn validate_and_resolve_dep_path(
+    project_root: &Path,
+    dep_name: &str,
+    raw_path: &str,
+) -> Result<PathBuf, String> {
+    let path = Path::new(raw_path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    if !resolved.exists() {
+        return Err(format!(
+            "Dependency '{}': path does not exist: '{}' (resolved to '{}')",
+            dep_name,
+            raw_path,
+            resolved.display()
+        ));
+    }
+    if !resolved.is_dir() {
+        return Err(format!(
+            "Dependency '{}': path is not a directory: '{}'",
+            dep_name,
+            resolved.display()
+        ));
+    }
+    let git_check = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&resolved)
+        .output();
+    match git_check {
+        Ok(output) if output.status.success() => Ok(resolved),
+        _ => Err(format!(
+            "Dependency '{}': '{}' is not a git repository",
+            dep_name,
+            resolved.display()
+        )),
+    }
+}
+
+/// Computes the worker-side worktree directory path for a dependency or main repository.
+pub fn worker_dep_path(
+    build_root: &str,
+    client_id: &str,
+    dep_name: &str,
+    worktree: &str,
+) -> PathBuf {
+    Path::new(build_root)
+        .join(client_id)
+        .join(dep_name)
+        .join(worktree)
+}
+
+/// A validated dependency with resolved local path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedDep {
+    pub name: String,
+    pub local_path: PathBuf,
+    pub bazel_module: Option<String>,
+}
+
+/// Resolves and validates all declared dependencies against `project_root` and `repo_name`.
+pub fn resolve_and_validate_deps(
+    project_root: &Path,
+    repo_name: &str,
+    deps: &BTreeMap<String, DepConfig>,
+) -> Result<Vec<ResolvedDep>, String> {
+    let mut resolved = Vec::with_capacity(deps.len());
+    for (name, dep) in deps {
+        validate_dep_name(name, repo_name)?;
+        let local_path = validate_and_resolve_dep_path(project_root, name, &dep.path)?;
+        resolved.push(ResolvedDep {
+            name: name.clone(),
+            local_path,
+            bazel_module: dep.bazel_module.clone(),
+        });
+    }
+    Ok(resolved)
+}
+
+/// Combines existing environment variables with `RBUILD_DEP_<NAME>=<path>` for dependencies.
+pub fn build_dep_command_envs(
+    path_envs: &[(String, String)],
+    dep_remote_paths: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let mut envs = path_envs.to_vec();
+    for (dep_name, dep_path) in dep_remote_paths {
+        envs.push((dep_env_var_name(dep_name), dep_path.to_string()));
+    }
+    envs
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -469,5 +624,256 @@ remote_path_entries = ["/opt/bazel/bin", "/usr/local/go/bin"]
             connection_attempts, 1,
             "build failures do not probe/fail over to another worker"
         );
+    }
+
+    #[test]
+    fn test_deps_toml_parsing_relative_absolute_and_bazel_module() {
+        let toml_str = r#"
+[deps.shizuku]
+path = "../Shizuku-v3"
+bazel_module = "shizuku"
+
+[deps.external_lib]
+path = "/opt/libs/ext"
+"#;
+        let project: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(project.deps.len(), 2);
+
+        let shizuku = &project.deps["shizuku"];
+        assert_eq!(shizuku.path, "../Shizuku-v3");
+        assert_eq!(shizuku.bazel_module.as_deref(), Some("shizuku"));
+
+        let ext = &project.deps["external_lib"];
+        assert_eq!(ext.path, "/opt/libs/ext");
+        assert_eq!(ext.bazel_module, None);
+    }
+
+    #[test]
+    fn test_deps_empty_backward_compatibility() {
+        let toml_str = r#"
+[jobs.build]
+worker = "main-lxc"
+args = ["build", "//pkg:app"]
+"#;
+        let project: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert!(project.deps.is_empty());
+        assert_eq!(project.jobs.len(), 1);
+        assert_eq!(project.jobs["build"].worker, "main-lxc");
+    }
+
+    #[test]
+    fn test_dep_env_var_name_transformation() {
+        assert_eq!(dep_env_var_name("shizuku"), "RBUILD_DEP_SHIZUKU");
+        assert_eq!(dep_env_var_name("Shizuku-v3"), "RBUILD_DEP_SHIZUKU_V3");
+        assert_eq!(
+            dep_env_var_name("my.cool-lib_2"),
+            "RBUILD_DEP_MY_COOL_LIB_2"
+        );
+        assert_eq!(dep_env_var_name("abc 123"), "RBUILD_DEP_ABC_123");
+    }
+
+    #[test]
+    fn test_worker_dep_path_construction() {
+        let path = worker_dep_path("/srv/build", "macbook", "shizuku", "main");
+        assert_eq!(path, PathBuf::from("/srv/build/macbook/shizuku/main"));
+
+        let main_path = worker_dep_path("/srv/build", "macbook", "my-app", "main");
+        assert_ne!(path, main_path);
+        assert_eq!(main_path, PathBuf::from("/srv/build/macbook/my-app/main"));
+    }
+
+    #[test]
+    fn test_validate_dep_name_conflicts_and_reserved() {
+        // Main repository name conflict
+        let err = validate_dep_name("my-repo", "my-repo").unwrap_err();
+        assert_eq!(
+            err,
+            "Dependency name 'my-repo' conflicts with repository name 'my-repo'"
+        );
+
+        // Reserved names
+        assert_eq!(
+            validate_dep_name("local", "my-repo").unwrap_err(),
+            "Dependency name 'local' is a reserved name"
+        );
+        assert_eq!(
+            validate_dep_name("agent", "my-repo").unwrap_err(),
+            "Dependency name 'agent' is a reserved name"
+        );
+        assert_eq!(
+            validate_dep_name(".", "my-repo").unwrap_err(),
+            "Dependency name '.' is a reserved name"
+        );
+        assert_eq!(
+            validate_dep_name("..", "my-repo").unwrap_err(),
+            "Dependency name '..' is a reserved name"
+        );
+        assert_eq!(
+            validate_dep_name(".git", "my-repo").unwrap_err(),
+            "Dependency name '.git' is a reserved name"
+        );
+        assert_eq!(
+            validate_dep_name(".rbuild", "my-repo").unwrap_err(),
+            "Dependency name '.rbuild' is a reserved name"
+        );
+
+        // Path separators / unsafe characters
+        assert!(
+            validate_dep_name("foo/bar", "my-repo")
+                .unwrap_err()
+                .contains("must be a safe single path component without separators")
+        );
+        assert!(
+            validate_dep_name("foo\\bar", "my-repo")
+                .unwrap_err()
+                .contains("must be a safe single path component without separators")
+        );
+
+        // Empty or whitespace
+        assert_eq!(
+            validate_dep_name("", "my-repo").unwrap_err(),
+            "Dependency name cannot be empty"
+        );
+        assert_eq!(
+            validate_dep_name("   ", "my-repo").unwrap_err(),
+            "Dependency name cannot be empty"
+        );
+        assert_eq!(
+            validate_dep_name(" foo ", "my-repo").unwrap_err(),
+            "Dependency name ' foo ' contains leading or trailing whitespace"
+        );
+
+        // Valid name
+        assert!(validate_dep_name("shizuku", "my-repo").is_ok());
+        assert!(validate_dep_name("pico-sdk_v2", "my-repo").is_ok());
+    }
+
+    #[test]
+    fn test_validate_and_resolve_dep_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_root = temp_dir.path().join("project");
+        let valid_dep = temp_dir.path().join("dep_repo");
+        let non_git_dir = temp_dir.path().join("plain_dir");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&valid_dep).unwrap();
+        fs::create_dir_all(&non_git_dir).unwrap();
+
+        // Initialize git in valid_dep
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&valid_dep)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // Relative path resolution to valid git repo
+        let resolved =
+            validate_and_resolve_dep_path(&project_root, "my_dep", "../dep_repo").unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            valid_dep.canonicalize().unwrap()
+        );
+
+        // Absolute path resolution
+        let resolved_abs =
+            validate_and_resolve_dep_path(&project_root, "my_dep", valid_dep.to_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            resolved_abs.canonicalize().unwrap(),
+            valid_dep.canonicalize().unwrap()
+        );
+
+        // Missing path
+        let missing_err =
+            validate_and_resolve_dep_path(&project_root, "missing", "../non_existent").unwrap_err();
+        assert!(missing_err.contains("path does not exist"));
+
+        // Directory is not a git repository
+        let non_git_err =
+            validate_and_resolve_dep_path(&project_root, "plain", "../plain_dir").unwrap_err();
+        assert!(non_git_err.contains("is not a git repository"));
+    }
+
+    #[test]
+    fn test_resolve_and_validate_deps() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_root = temp_dir.path().join("my-main-repo");
+        let dep1_dir = temp_dir.path().join("dep1");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&dep1_dir).unwrap();
+
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dep1_dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "shizuku".to_string(),
+            DepConfig {
+                path: "../dep1".to_string(),
+                bazel_module: Some("shizuku_mod".to_string()),
+            },
+        );
+
+        let resolved = resolve_and_validate_deps(&project_root, "my-main-repo", &deps).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "shizuku");
+        assert_eq!(resolved[0].bazel_module.as_deref(), Some("shizuku_mod"));
+        assert_eq!(
+            resolved[0].local_path.canonicalize().unwrap(),
+            dep1_dir.canonicalize().unwrap()
+        );
+
+        // Empty deps succeeds with empty vector
+        let empty_deps = BTreeMap::new();
+        let resolved_empty =
+            resolve_and_validate_deps(&project_root, "my-main-repo", &empty_deps).unwrap();
+        assert!(resolved_empty.is_empty());
+
+        // Conflicting dep name with main repo
+        let mut conflict_deps = BTreeMap::new();
+        conflict_deps.insert(
+            "my-main-repo".to_string(),
+            DepConfig {
+                path: "../dep1".to_string(),
+                bazel_module: None,
+            },
+        );
+        let conflict_err =
+            resolve_and_validate_deps(&project_root, "my-main-repo", &conflict_deps).unwrap_err();
+        assert!(conflict_err.contains("conflicts with repository name"));
+    }
+
+    #[test]
+    fn test_build_dep_command_envs() {
+        let base_envs = vec![("PATH".to_string(), "/custom/bin".to_string())];
+        let dep_paths = [
+            ("shizuku", "/srv/build/c/shizuku/main"),
+            ("foo-bar.baz_1", "/srv/build/c/foo-bar.baz_1/main"),
+        ];
+        let result = build_dep_command_envs(&base_envs, &dep_paths);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], ("PATH".to_string(), "/custom/bin".to_string()));
+        assert_eq!(
+            result[1],
+            (
+                "RBUILD_DEP_SHIZUKU".to_string(),
+                "/srv/build/c/shizuku/main".to_string()
+            )
+        );
+        assert_eq!(
+            result[2],
+            (
+                "RBUILD_DEP_FOO_BAR_BAZ_1".to_string(),
+                "/srv/build/c/foo-bar.baz_1/main".to_string()
+            )
+        );
+
+        // Empty deps leaves base envs unchanged
+        let empty_result = build_dep_command_envs(&base_envs, &[]);
+        assert_eq!(empty_result, base_envs);
     }
 }
