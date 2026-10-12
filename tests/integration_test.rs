@@ -1772,3 +1772,119 @@ exit 1
         log_content
     );
 }
+
+#[test]
+fn test_cquery_multiple_targets_single_expression_and_unquotable_rejection() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let remote_base = temp_root.path().join("srv_build");
+    let client_out_dir = temp_root.path().join(".rbuild-out");
+    fs::create_dir_all(&remote_base).unwrap();
+
+    let (mut session, agent_thread) = setup_agent_client_pair(&remote_base);
+    session.handshake(None).unwrap();
+    let wt_str = session.lock_worktree("user1", "myrepo", "main").unwrap();
+    let wt = Path::new(&wt_str);
+
+    // 複数成果物（2つ以上のファイル）を配置
+    let bin_dir = wt.join("bazel-bin/pkg");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let file1 = bin_dir.join("file1.txt");
+    fs::write(&file1, b"content of file 1").unwrap();
+    let file2 = bin_dir.join("file2.txt");
+    fs::write(&file2, b"content of file 2").unwrap();
+
+    // 引数を記録する fake bazelisk スクリプトを作成
+    let log_file = wt.join("cquery_argv.log");
+    let fake_bazelisk = wt.join("fake_bazelisk.sh");
+    let script_content = format!(
+        r#"#!/bin/sh
+if [ "$1" = "cquery" ]; then
+    for arg in "$@"; do
+        echo "$arg" >> "{log}"
+    done
+    echo "bazel-bin/pkg/file1.txt"
+    echo "bazel-bin/pkg/file2.txt"
+    exit 0
+fi
+exit 1
+"#,
+        log = log_file.display()
+    );
+    fs::write(&fake_bazelisk, script_content).unwrap();
+    fs::set_permissions(&fake_bazelisk, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 1. 複数ターゲットを指定して成果物回収を実行
+    let targets = vec!["//pkg:target1".to_string(), "//pkg:target2".to_string()];
+    let flags = vec!["--flag_example=1".to_string()];
+    let count = session
+        .collect_artifacts(
+            &client_out_dir,
+            Some(&fake_bazelisk.to_string_lossy()),
+            &targets,
+            &flags,
+        )
+        .expect("Artifact collection for multiple targets must succeed");
+
+    // 複数成果物（2つ以上のファイル）が実際に回収されることを assert
+    assert_eq!(count, 2, "Expected 2 artifacts collected");
+    let local_file1 = client_out_dir.join("pkg/file1.txt");
+    let local_file2 = client_out_dir.join("pkg/file2.txt");
+    assert!(local_file1.exists(), "Collected file1 must exist");
+    assert!(local_file2.exists(), "Collected file2 must exist");
+    assert_eq!(
+        fs::read(&local_file1).unwrap(),
+        b"content of file 1",
+        "file1 content must match"
+    );
+    assert_eq!(
+        fs::read(&local_file2).unwrap(),
+        b"content of file 2",
+        "file2 content must match"
+    );
+
+    // fake Bazel が cquery 呼び出しで「単一の query 式 argv」を受け取ることを記録/検証
+    let log_content = fs::read_to_string(&log_file).unwrap();
+    let received_args: Vec<&str> = log_content.lines().collect();
+    assert_eq!(
+        received_args.len(),
+        4,
+        "cquery command must have exactly 4 argv elements (cquery, --output=files, query_expr, flags). Got: {:?}",
+        received_args
+    );
+    assert_eq!(received_args[0], "cquery");
+    assert_eq!(received_args[1], "--output=files");
+    assert_eq!(
+        received_args[2], r#"set("//pkg:target1" "//pkg:target2")"#,
+        "Multiple targets must be passed as a single set(...) query expression argv"
+    );
+    assert_eq!(
+        received_args[3], "--flag_example=1",
+        "Flags must be passed as argv after the query expression"
+    );
+
+    // 2. 引用不能ラベルで成果物回収を試行し、ok:false かつ cquery が呼ばれないことを assert
+    // ログファイルをクリア
+    fs::write(&log_file, b"").unwrap();
+
+    let unquotable_targets = vec![r#"//pkg:bad"quote'mix"#.to_string()];
+    let unquotable_res = session.collect_artifacts(
+        &client_out_dir,
+        Some(&fake_bazelisk.to_string_lossy()),
+        &unquotable_targets,
+        &[],
+    );
+    assert!(
+        unquotable_res.is_err(),
+        "Artifact collection must fail for unquotable targets"
+    );
+
+    let log_after_unquotable = fs::read_to_string(&log_file).unwrap();
+    assert!(
+        log_after_unquotable.is_empty(),
+        "cquery must NOT be called when targets are unquotable, but log was: {}",
+        log_after_unquotable
+    );
+
+    drop(session);
+    let _ = agent_thread.join();
+}

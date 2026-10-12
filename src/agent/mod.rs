@@ -371,11 +371,24 @@ impl AgentSession {
                     }
                 };
 
+                let expr = match build_cquery_set_expression(&targets) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let resp = Message::CollectArtifactsResponse {
+                            ok: false,
+                            artifact_count: 0,
+                            error: Some(format!("Failed to build cquery expression: {}", e)),
+                        };
+                        write_message(writer, &resp)?;
+                        return Ok(true);
+                    }
+                };
+
                 let bin = command.unwrap_or_else(|| "bazelisk".to_string());
                 let mut cmd = remote_command(&bin, &wt, &envs);
                 cmd.arg("cquery")
                     .arg("--output=files")
-                    .args(&targets)
+                    .arg(expr)
                     .args(&flags);
 
                 let output = match cmd.output() {
@@ -624,6 +637,68 @@ fn join_path(prepend: &str, inherited: &str) -> String {
     } else {
         format!("{prepend}:{inherited}")
     }
+}
+
+/// Builds a single Bazel cquery set expression for the given targets.
+///
+/// In Bazel 7+, passing multiple targets to `cquery --output=files` fails with
+/// "unexpected token after query expression". Instead, all targets must be wrapped
+/// in a single query expression, such as `set("//:one" "//:two")`.
+///
+/// Quoting rules:
+/// - Validates that the target list is not empty.
+/// - Validates that no target is empty, contains whitespace, or contains control characters.
+/// - Chooses a single uniform quote character (`"` or `'`) across all targets.
+///   If any target contains `"`, `'` is chosen. If any target contains `'`, `"` is chosen.
+///   If both quotes are present across the targets (or within a single target), quoting fails closed with `Err`.
+/// - Preserves the input order and duplicate entries of targets (Bazel's `set()` evaluates to a set).
+pub fn build_cquery_set_expression<S: AsRef<str>>(targets: &[S]) -> Result<String, String> {
+    if targets.is_empty() {
+        return Err("Target list cannot be empty".to_string());
+    }
+
+    let mut has_double_quote = false;
+    let mut has_single_quote = false;
+
+    for target in targets {
+        let s = target.as_ref();
+        if s.is_empty() {
+            return Err("Target label cannot be empty".to_string());
+        }
+        if s.chars().any(|c| c.is_whitespace()) {
+            return Err(format!("Target label '{}' contains whitespace", s));
+        }
+        if s.chars().any(|c| c.is_control()) {
+            return Err(format!("Target label '{}' contains control characters", s));
+        }
+        if s.contains('"') {
+            has_double_quote = true;
+        }
+        if s.contains('\'') {
+            has_single_quote = true;
+        }
+    }
+
+    if has_double_quote && has_single_quote {
+        return Err(
+            "Cannot safely quote targets: labels contain both single and double quotes".to_string(),
+        );
+    }
+
+    let quote = if !has_double_quote { '"' } else { '\'' };
+
+    let mut expr = String::from("set(");
+    for (i, t) in targets.iter().enumerate() {
+        if i > 0 {
+            expr.push(' ');
+        }
+        expr.push(quote);
+        expr.push_str(t.as_ref());
+        expr.push(quote);
+    }
+    expr.push(')');
+
+    Ok(expr)
 }
 
 /// Asks Bazel for its `output_path` in the worktree. No local fallback is attempted.
@@ -1140,6 +1215,160 @@ mod tests {
                 );
             }
             other => panic!("Expected HandshakeResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_cquery_set_expression_plus_and_equals() {
+        // 必須テスト1: `+` と `=` を含む2ラベルで期待式と完全一致
+        let targets = ["//pkg:target+1", "//pkg:target=2"];
+        let expr = build_cquery_set_expression(&targets).unwrap();
+        assert_eq!(expr, r#"set("//pkg:target+1" "//pkg:target=2")"#);
+    }
+
+    #[test]
+    fn test_build_cquery_set_expression_query_syntax_like_label() {
+        // 必須テスト2: クエリ構文に似たラベルが引用符内に閉じ込められ、単一の set(...) 式になる
+        // ※空白を含むラベルは必須テスト5のセキュリティ仕様で拒否されるため、
+        // 空白を含まないクエリ構文類似ラベル（演算子や括弧を含む）を検証する
+        let targets = [")+//evil:target"];
+        let expr = build_cquery_set_expression(&targets).unwrap();
+        assert_eq!(expr, r#"set(")+//evil:target")"#);
+
+        let targets_deps = [")+deps(//evil:target)"];
+        let expr_deps = build_cquery_set_expression(&targets_deps).unwrap();
+        assert_eq!(expr_deps, r#"set(")+deps(//evil:target)")"#);
+    }
+
+    #[test]
+    fn test_build_cquery_set_expression_duplicates_preserved() {
+        // 必須テスト3: 重複入力ラベルの扱い
+        // 仕様: 入力順序および重複をそのまま保持する (Bazel の set() 自体が集合として重複を排除して評価するため)
+        let targets = ["//pkg:dup", "//pkg:dup"];
+        let expr = build_cquery_set_expression(&targets).unwrap();
+        assert_eq!(expr, r#"set("//pkg:dup" "//pkg:dup")"#);
+    }
+
+    #[test]
+    fn test_build_cquery_set_expression_single_type_of_quotes() {
+        // 必須テスト4: ラベル内に片側の引用符(" のみ / ' のみ)があるとき、もう一方の引用符を全体で選んで成功する
+        // ダブルクォートを含む場合 -> 全体をシングルクォートで引用
+        let targets_with_double = [r#"//pkg:foo"bar"#, "//pkg:normal"];
+        let expr_single = build_cquery_set_expression(&targets_with_double).unwrap();
+        assert_eq!(expr_single, r#"set('//pkg:foo"bar' '//pkg:normal')"#);
+
+        // シングルクォートを含む場合 -> 全体をダブルクォートで引用
+        let targets_with_single = ["//pkg:foo'bar", "//pkg:normal"];
+        let expr_double = build_cquery_set_expression(&targets_with_single).unwrap();
+        assert_eq!(expr_double, r#"set("//pkg:foo'bar" "//pkg:normal")"#);
+    }
+
+    #[test]
+    fn test_build_cquery_set_expression_error_cases() {
+        // 必須テスト5: 空リスト、空文字列、空白入りラベル、制御文字入りラベル、" と ' の両方を含むラベル(混在引用符)が Err
+        // 空リスト
+        let empty_list: [&str; 0] = [];
+        assert!(
+            build_cquery_set_expression(&empty_list).is_err(),
+            "Empty targets list must be rejected"
+        );
+
+        // 空文字列
+        assert!(
+            build_cquery_set_expression(&[""]).is_err(),
+            "Empty target label must be rejected"
+        );
+        assert!(
+            build_cquery_set_expression(&["//pkg:target", ""]).is_err(),
+            "Target list containing empty string must be rejected"
+        );
+
+        // 空白入りラベル (スペース, タブ, 改行, 依頼文の例 ') union //evil:target' など)
+        assert!(
+            build_cquery_set_expression(&["//pkg:target one"]).is_err(),
+            "Label containing space must be rejected"
+        );
+        assert!(
+            build_cquery_set_expression(&["//pkg:target\tone"]).is_err(),
+            "Label containing tab must be rejected"
+        );
+        assert!(
+            build_cquery_set_expression(&[") union //evil:target"]).is_err(),
+            "Query syntax injection with spaces must be rejected due to whitespace"
+        );
+
+        // 制御文字入りラベル
+        assert!(
+            build_cquery_set_expression(&["//pkg:target\x00one"]).is_err(),
+            "Label containing null byte must be rejected"
+        );
+        assert!(
+            build_cquery_set_expression(&["//pkg:target\x1fone"]).is_err(),
+            "Label containing control character must be rejected"
+        );
+        assert!(
+            build_cquery_set_expression(&["//pkg:target\ntwo"]).is_err(),
+            "Label containing newline control char must be rejected"
+        );
+
+        // " と ' の両方を含むラベル (単一ラベル内に両方)
+        assert!(
+            build_cquery_set_expression(&[r#"//pkg:target'"mix"#]).is_err(),
+            "Label containing both single and double quotes must be rejected"
+        );
+
+        // " と ' の両方を含むターゲットリスト (別々のラベルに分散)
+        assert!(
+            build_cquery_set_expression(&[r#"//pkg:double"quote"#, "//pkg:single'quote"]).is_err(),
+            "Target list with mixed quote types must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_agent_collect_artifacts_unquotable_targets_rejected_without_executing_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = AgentSession::new(dir.path().to_path_buf(), None);
+        let mut output = Vec::new();
+
+        // ワークツリーをロック
+        let lock_req = Message::LockWorktreeRequest {
+            client_id: "user1".to_string(),
+            repo: "myrepo".to_string(),
+            worktree: "main".to_string(),
+        };
+        session.handle_message(&mut output, lock_req).unwrap();
+        output.clear();
+
+        // 引用不能ラベル (ダブルクォートとシングルクォートの両方を含む) を指定
+        let collect_req = Message::CollectArtifactsRequest {
+            // 存在しないコマンドを指定しても cquery 自体が実行されないためエラーにならないことを確認
+            command: Some("/path/to/nonexistent/cquery_binary".to_string()),
+            targets: vec![r#"//pkg:target'"both"#.to_string()],
+            flags: vec![],
+            envs: vec![],
+        };
+
+        session.handle_message(&mut output, collect_req).unwrap();
+        let mut cursor = std::io::Cursor::new(output);
+        let resp: Message = crate::protocol::read_message(&mut cursor).unwrap().unwrap();
+
+        match resp {
+            Message::CollectArtifactsResponse {
+                ok,
+                artifact_count,
+                error,
+            } => {
+                assert!(!ok, "Response ok must be false for unquotable targets");
+                assert_eq!(
+                    artifact_count, 0,
+                    "artifact_count must be 0 for unquotable targets"
+                );
+                assert!(
+                    error.is_some(),
+                    "Error message must be present for unquotable targets"
+                );
+            }
+            other => panic!("Expected CollectArtifactsResponse, got {:?}", other),
         }
     }
 }
