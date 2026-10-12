@@ -589,6 +589,7 @@ fn run_session_workflow<T: Transport>(
             std::process::exit(exit_code);
         }
 
+        let mut bazel_artifacts_collected = false;
         // If this was a build command, collect build artifacts into .rbuild-out
         if parsed.subcommand.as_deref() == Some("build") {
             if parsed.is_ambiguous {
@@ -614,10 +615,20 @@ fn run_session_workflow<T: Transport>(
                 )?;
                 println!("rbuild: Successfully collected {} artifact(s).", count);
                 finalize_debug_artifacts(&out_dir, &remote_path, params.current_dir)?;
+                bazel_artifacts_collected = true;
             }
         }
         if !job_artifacts.is_empty() {
-            session.collect_paths(&params.current_dir.join(".rbuild-out"), &job_artifacts)?;
+            let output_dir = params.current_dir.join(".rbuild-out");
+            let artifacts = if bazel_artifacts_collected {
+                remaining_job_artifacts(&job_artifacts, &output_dir)
+            } else {
+                job_artifacts.iter().collect()
+            };
+            if !artifacts.is_empty() {
+                let artifacts: Vec<String> = artifacts.into_iter().cloned().collect();
+                session.collect_paths(&output_dir, &artifacts)?;
+            }
         }
     }
 
@@ -633,6 +644,30 @@ fn finalize_debug_artifacts(out_dir: &Path, remote_root: &str, local_root: &Path
     )?;
     rbuild::debug_map::write_debug_map(out_dir, remote_root, &local)?;
     Ok(())
+}
+
+/// Returns job artifact paths that were not already written by Bazel cquery collection.
+fn remaining_job_artifacts<'a>(paths: &'a [String], output_dir: &Path) -> Vec<&'a String> {
+    paths
+        .iter()
+        .filter(|path| {
+            let path = path.trim_start_matches("./");
+            let output_rel = if let Some(path) = path.strip_prefix("bazel-bin/") {
+                Some(path)
+            } else if let Some(path) = path.strip_prefix("bazel-out/") {
+                path.split_once("/bin/").map(|(_, rel)| rel)
+            } else {
+                None
+            };
+            let output_rel = output_rel.filter(|rel| {
+                !rel.is_empty()
+                    && Path::new(rel)
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_)))
+            });
+            !output_rel.is_some_and(|rel| output_dir.join(rel).is_file())
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -769,6 +804,31 @@ pub fn parse_bazel_args(args: &[String]) -> ParsedBazelArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bazel_job_artifacts_already_collected_by_cquery_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join(".rbuild-out");
+        fs::create_dir_all(output_dir.join("firmware/complicated_wires")).unwrap();
+        fs::write(
+            output_dir.join("firmware/complicated_wires/complicated_wires.uf2"),
+            b"built",
+        )
+        .unwrap();
+        fs::create_dir_all(output_dir.join("pkg")).unwrap();
+        fs::write(output_dir.join("pkg/app"), b"built app").unwrap();
+        let paths = vec![
+            "bazel-bin/firmware/complicated_wires/complicated_wires.uf2".to_string(),
+            "bazel-out/k8-fastbuild/bin/pkg/app".to_string(),
+            "bazel-bin/other/extra.uf2".to_string(),
+        ];
+
+        assert_eq!(
+            remaining_job_artifacts(&paths, &output_dir),
+            vec![&paths[2]],
+            "cquery output must not be collected a second time"
+        );
+    }
 
     #[test]
     fn test_parse_bazel_args() {
