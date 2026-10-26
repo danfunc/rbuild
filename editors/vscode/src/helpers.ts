@@ -8,6 +8,55 @@ export function debugMapPatch(remoteRoot: string, localRoot: string): Record<str
   return { [remoteRoot]: localRoot };
 }
 
+export interface ParsedPackageOrigin {
+  protocol_conformance?: { type_name: string };
+}
+
+export interface ParsedTargetSummary {
+  name: string;
+  kind: string;
+  effective_path: string;
+  dependencies?: string[];
+  cxx_flags?: string[];
+  linker_flags?: string[];
+  output_format?: string;
+}
+
+export interface ParsedPackageEntry {
+  manifest: {
+    name: string;
+    origin?: string | ParsedPackageOrigin;
+    tools_version?: string;
+    cxx_language_standard?: string;
+  };
+  resolved_plan: ParsedTargetSummary[];
+}
+
+/** Formats the JSON output of `rbuild parse-swift --json` into Output lines showing Package conformances and targets. */
+export function formatPackagesSummary(raw: unknown): string[] {
+  if (!raw || typeof raw !== 'object') return [];
+  const data = raw as { parse_time_micros?: number; packages?: ParsedPackageEntry[]; manifest?: ParsedPackageEntry['manifest']; resolved_plan?: ParsedTargetSummary[] };
+  const entries: ParsedPackageEntry[] = Array.isArray(data.packages) && data.packages.length > 0
+    ? data.packages
+    : (data.manifest && Array.isArray(data.resolved_plan) ? [{ manifest: data.manifest, resolved_plan: data.resolved_plan }] : []);
+  const lines: string[] = [];
+  for (const entry of entries) {
+    const { manifest, resolved_plan } = entry;
+    const originObj = typeof manifest.origin === 'object' && manifest.origin !== null ? manifest.origin : undefined;
+    const originLabel = originObj?.protocol_conformance?.type_name
+      ? `struct ${originObj.protocol_conformance.type_name}: Package`
+      : 'Package(...)';
+    const timeSuffix = typeof data.parse_time_micros === 'number' ? ` (${data.parse_time_micros}µs)` : '';
+    lines.push(`[package] ${manifest.name} [${originLabel}]${timeSuffix}`);
+    for (const target of resolved_plan) {
+      const deps = target.dependencies?.length ? ` deps=[${target.dependencies.join(', ')}]` : '';
+      const fmt = target.output_format ? ` format=${target.output_format}` : '';
+      lines.push(`  - [${target.kind}] ${target.name} (${target.effective_path})${deps}${fmt}`);
+    }
+  }
+  return lines;
+}
+
 // ---- Output formatting and progress (pure, unit-tested) ----
 
 export type Stage = 'sync' | 'build' | 'fetch' | 'run';

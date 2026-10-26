@@ -45,19 +45,36 @@ impl ManifestCache {
 /// Lists files in the git repository using `git ls-files -co --exclude-standard`.
 /// Returns an error if the directory is not a git repository.
 pub fn collect_repository_files(repo_root: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .arg("ls-files")
-        .arg("-co")
-        .arg("-z")
-        .arg("--exclude-standard")
+    let ls_child = Command::new("git")
+        .args(["ls-files", "-co", "-z", "--exclude-standard"])
         .current_dir(repo_root)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| {
             format!(
                 "Failed to execute 'git ls-files' in {}",
                 repo_root.display()
             )
         })?;
+
+    let stage_child = Command::new("git")
+        .args(["ls-files", "--stage", "-z"])
+        .current_dir(repo_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to inspect git index in {}", repo_root.display()))?;
+
+    let output = ls_child.wait_with_output().with_context(|| {
+        format!(
+            "Failed to wait for 'git ls-files' in {}",
+            repo_root.display()
+        )
+    })?;
+    let staged = stage_child
+        .wait_with_output()
+        .with_context(|| format!("Failed to wait for git index in {}", repo_root.display()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -75,11 +92,6 @@ pub fn collect_repository_files(repo_root: &Path) -> Result<Vec<String>> {
         .filter(|path| !path.is_empty())
         .map(|path| String::from_utf8_lossy(path).into_owned())
         .collect::<Vec<_>>();
-    let staged = Command::new("git")
-        .args(["ls-files", "--stage", "-z"])
-        .current_dir(repo_root)
-        .output()
-        .with_context(|| format!("Failed to inspect git index in {}", repo_root.display()))?;
     if !staged.status.success() {
         anyhow::bail!(
             "Failed to inspect git index in {}: {}",

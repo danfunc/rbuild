@@ -2,7 +2,7 @@
   "name": "rbuild",
   "displayName": "rbuild",
   "description": "Run rbuild remote builds and launch a configured debugger.",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "publisher": "local",
   "license": "MIT",
   "engines": { "vscode": "^1.85.0" },
@@ -14,6 +14,7 @@
       { "command": "rbuild.build", "title": "rbuild: Build" },
       { "command": "rbuild.run", "title": "rbuild: Run" },
       { "command": "rbuild.debug", "title": "rbuild: Build and Debug" },
+      { "command": "rbuild.packages", "title": "rbuild: Show Packages" },
       { "command": "rbuild.cancel", "title": "rbuild: Cancel Build" }
     ],
     "keybindings": [
@@ -27,7 +28,8 @@
     "menus": { "editor/title": [
       { "command": "rbuild.build", "when": "resourceScheme == file", "group": "navigation" },
       { "command": "rbuild.run", "when": "resourceScheme == file", "group": "navigation" },
-      { "command": "rbuild.debug", "when": "resourceScheme == file", "group": "navigation" }
+      { "command": "rbuild.debug", "when": "resourceScheme == file", "group": "navigation" },
+      { "command": "rbuild.packages", "when": "resourceScheme == file", "group": "navigation" }
     ] },
     "configuration": { "title": "rbuild", "properties": {
       "rbuild.executable": { "type": "string", "default": "rbuild", "description": "Path to the local rbuild executable." },

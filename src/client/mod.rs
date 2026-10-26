@@ -4,14 +4,108 @@ use crate::client::transport::Transport;
 use crate::progress::{self, Progress};
 use crate::protocol::message::{ManifestEntry, Message, SyncFileChunk};
 use crate::sync::apply::apply_file_chunk;
-use crate::sync::manifest::{ManifestCache, build_manifest};
-use crate::sync::path_safety::resolve_safe_path;
+use crate::sync::diff::record_synced_file_in_cache;
+use crate::sync::manifest::{CacheEntry, ManifestCache, build_manifest};
+use crate::sync::path_safety::{is_safe_relative_path, resolve_safe_path};
 use crate::version::{PROTOCOL_VERSION, get_current_build_id};
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+
+const ARTIFACT_CACHE_FILE: &str = ".rbuild_artifact_cache.json";
+
+fn collect_local_artifact_files(root: &Path, current: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(".rbuild")
+            || name == "compile_commands.json"
+            || name == "rbuild-debug-map.json"
+        {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            collect_local_artifact_files(root, &path, out);
+        } else if ft.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if is_safe_relative_path(&rel_str).is_ok() {
+                    out.push(rel_str);
+                }
+            }
+        }
+    }
+}
+
+fn build_known_artifacts(output_dir: &Path) -> BTreeMap<String, String> {
+    let mut known = BTreeMap::new();
+    if !output_dir.exists() {
+        return known;
+    }
+    let cache_path = output_dir.join(ARTIFACT_CACHE_FILE);
+    let mut cache = ManifestCache::load_from_file(&cache_path);
+    let mut next_entries = std::collections::HashMap::new();
+    let mut rel_files = Vec::new();
+    collect_local_artifact_files(output_dir, output_dir, &mut rel_files);
+
+    for rel in rel_files {
+        let full = output_dir.join(&rel);
+        let Ok(meta) = fs::symlink_metadata(&full) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as i64, d.subsec_nanos()));
+
+        let hash = match (mtime, cache.entries.get(&rel)) {
+            (Some((secs, nanos)), Some(cached))
+                if cached.size == size
+                    && cached.mtime_secs == secs
+                    && cached.mtime_nanos == nanos =>
+            {
+                cached.blake3_hash.clone()
+            }
+            _ => {
+                let Ok(bytes) = fs::read(&full) else {
+                    continue;
+                };
+                blake3::hash(&bytes).to_hex().to_string()
+            }
+        };
+
+        if let Some((mtime_secs, mtime_nanos)) = mtime {
+            next_entries.insert(
+                rel.clone(),
+                CacheEntry {
+                    size,
+                    mtime_secs,
+                    mtime_nanos,
+                    blake3_hash: hash.clone(),
+                },
+            );
+        }
+        known.insert(rel, hash);
+    }
+
+    cache.entries = next_entries;
+    let _ = cache.save_to_file(&cache_path);
+    known
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncStats {
@@ -43,6 +137,7 @@ impl CollectProgress {
             Message::ArtifactStart { raw_len, .. } => self.current_len = *raw_len,
             Message::ArtifactEnd { .. } => self.finish_file(self.current_len),
             Message::ArtifactChunk(chunk) => self.finish_file(chunk.raw_len),
+            Message::ArtifactUnchanged { .. } => self.finish_file(0),
             _ => {}
         }
     }
@@ -89,6 +184,21 @@ fn handle_artifact_transfer(
     message: Message,
 ) -> Result<Option<Message>> {
     match message {
+        Message::ArtifactUnchanged { path } => {
+            if pending.is_some() {
+                bail!("Received overlapping artifact transfers");
+            }
+            let target = resolve_safe_path(output_dir, &path)
+                .map_err(|e| anyhow::anyhow!("Unsafe artifact path: {e}"))?;
+            if !target.exists() {
+                bail!(
+                    "Agent reported unchanged artifact '{}' but local file is missing",
+                    path
+                );
+            }
+            *count += 1;
+            Ok(None)
+        }
         Message::ArtifactStart {
             path,
             mode,
@@ -161,6 +271,10 @@ fn handle_artifact_transfer(
                 .temp
                 .persist(&state.target)
                 .with_context(|| format!("Persisting artifact {}", state.path))?;
+            let cache_path = output_dir.join(ARTIFACT_CACHE_FILE);
+            let mut cache = ManifestCache::load_from_file(&cache_path);
+            record_synced_file_in_cache(output_dir, &mut cache, &state.path, &state.expected_hash);
+            let _ = cache.save_to_file(&cache_path);
             *count += 1;
             Ok(None)
         }
@@ -339,6 +453,7 @@ impl<T: Transport> ClientSession<T> {
             Some(total_bytes),
         ));
 
+        let mut sent_files: Vec<(&str, u64)> = Vec::with_capacity(needed_files.len());
         for rel_path in &needed_files {
             let entry = match entry_map.get(rel_path.as_str()) {
                 Some(e) => *e,
@@ -376,11 +491,14 @@ impl<T: Transport> ClientSession<T> {
             };
 
             self.transport.send(&Message::SyncFileChunk(chunk))?;
+            sent_files.push((rel_path.as_str(), entry.size));
+        }
 
+        for (rel_path, size) in sent_files {
             match self.transport.recv()? {
                 Message::SyncFileResponse { ok: true, .. } => {
                     transferred += 1;
-                    done_bytes += entry.size;
+                    done_bytes += size;
                     progress::emit(&Progress::transfer(
                         "sync",
                         "progress",
@@ -518,8 +636,10 @@ impl<T: Transport> ClientSession<T> {
     /// Copies validated worktree relative paths into the local output directory.
     pub fn collect_paths(&mut self, output_dir: &Path, paths: &[String]) -> Result<usize> {
         fs::create_dir_all(output_dir)?;
+        let known_artifacts = build_known_artifacts(output_dir);
         self.transport.send(&Message::CollectPathsRequest {
             paths: paths.to_vec(),
+            known_artifacts,
         })?;
         let mut count = 0usize;
         let mut pending = None;
@@ -585,12 +705,14 @@ impl<T: Transport> ClientSession<T> {
     ) -> Result<usize> {
         fs::create_dir_all(output_dir)
             .with_context(|| format!("Creating output directory: {}", output_dir.display()))?;
+        let known_artifacts = build_known_artifacts(output_dir);
 
         self.transport.send(&Message::CollectArtifactsRequest {
             command: command_override.map(|s| s.to_string()),
             targets: targets.to_vec(),
             flags: flags.to_vec(),
             envs: envs.to_vec(),
+            known_artifacts,
         })?;
 
         let mut collected = 0;

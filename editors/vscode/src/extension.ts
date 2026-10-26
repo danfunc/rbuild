@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
-import { debugMapPatch, parseArguments, OutputFormatter, LineSplitter, finishLine, Stage } from './helpers';
+import { debugMapPatch, parseArguments, formatPackagesSummary, OutputFormatter, LineSplitter, finishLine, Stage } from './helpers';
 
 let running: ChildProcess | undefined;
 let output: vscode.OutputChannel;
@@ -16,14 +16,50 @@ export function activate(context: vscode.ExtensionContext): void {
   debugButton.text = '$(debug) rbuild'; debugButton.tooltip = 'Build with rbuild and start debugger'; debugButton.command = 'rbuild.debug'; debugButton.show();
   const runButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 18);
   runButton.text = '$(play) rbuild'; runButton.tooltip = 'Run rbuild job run'; runButton.command = 'rbuild.run'; runButton.show();
-  progressItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 17);
+  const packagesButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 17);
+  packagesButton.text = '$(package) Packages'; packagesButton.tooltip = 'Inspect Package-conforming manifests with rbuild'; packagesButton.command = 'rbuild.packages'; packagesButton.show();
+  progressItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 16);
   progressItem.command = 'rbuild.cancel';
   progressItem.tooltip = 'rbuild is running; click to cancel';
-  context.subscriptions.push(progressItem, buildButton, debugButton, runButton,
+  context.subscriptions.push(progressItem, buildButton, debugButton, runButton, packagesButton,
     vscode.commands.registerCommand('rbuild.build', () => runConfigured('build')),
     vscode.commands.registerCommand('rbuild.run', () => runConfigured('run')),
     vscode.commands.registerCommand('rbuild.debug', () => runConfigured('build', true)),
+    vscode.commands.registerCommand('rbuild.packages', () => showPackages()),
     vscode.commands.registerCommand('rbuild.cancel', () => { running?.kill(); }));
+}
+
+async function showPackages(): Promise<void> {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder) { vscode.window.showErrorMessage('Open an rbuild workspace first.'); return; }
+  const config = vscode.workspace.getConfiguration('rbuild', folder.uri);
+  const executable = config.get<string>('executable', 'rbuild');
+  const activeFile = vscode.window.activeTextEditor?.document.uri.fsPath;
+  const manifestPath = activeFile && activeFile.endsWith('.swift') ? activeFile : 'Package.swift';
+  return new Promise<void>(resolve => {
+    const child = spawn(executable, ['parse-swift', manifestPath, '--json'], { cwd: folder.uri.fsPath, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', chunk => stdout += chunk.toString());
+    child.stderr?.on('data', chunk => stderr += chunk.toString());
+    child.on('error', err => { vscode.window.showErrorMessage(`Could not run rbuild: ${err.message}`); resolve(); });
+    child.on('close', code => {
+      if (code !== 0) {
+        vscode.window.showErrorMessage(stderr.trim() || `rbuild parse-swift exited with ${code}`);
+        return resolve();
+      }
+      try {
+        const parsed = JSON.parse(stdout);
+        const lines = formatPackagesSummary(parsed);
+        output.clear();
+        for (const line of lines) output.appendLine(line);
+        output.show(true);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Failed to parse package output: ${String(err)}`);
+      }
+      resolve();
+    });
+  });
 }
 
 async function runConfigured(job: 'build' | 'run', debug = false): Promise<void> {

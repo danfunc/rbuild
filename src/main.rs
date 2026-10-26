@@ -123,6 +123,73 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Parse a SwiftPM-style Package.swift manifest without swiftc
+    ParseSwift {
+        #[arg(
+            default_value = "Package.swift",
+            help = "Path to Package.swift manifest"
+        )]
+        path: PathBuf,
+
+        #[arg(
+            long,
+            help = "Target platform to evaluate .when(...) conditions (e.g. rp2350, esp32c5, macOS)"
+        )]
+        platform: Option<String>,
+
+        #[arg(
+            long,
+            help = "Build configuration to evaluate .when(...) conditions (e.g. debug, release)"
+        )]
+        configuration: Option<String>,
+
+        #[arg(long, help = "Emit full parsed manifest & resolved plan as JSON")]
+        json: bool,
+
+        #[arg(long, help = "Emit LLVM IR (.ll) compiled from the manifest")]
+        emit_llvm: bool,
+
+        #[arg(
+            long,
+            help = "Emit Ninja build file (build.ninja) from the resolved plan"
+        )]
+        emit_ninja: bool,
+
+        #[arg(
+            long,
+            help = "Emit JSON matching Apple's `swift package dump-package` schema"
+        )]
+        dump_package: bool,
+
+        #[arg(
+            long,
+            help = "Emit JSON matching Apple's `swift-frontend -dump-ast -dump-ast-format json` schema"
+        )]
+        dump_ast_json: bool,
+    },
+    /// Execute a native pure-function DAG build with BLAKE3 action caching directly from Package.swift
+    BuildSwift {
+        #[arg(
+            default_value = "Package.swift",
+            help = "Path to Package.swift manifest"
+        )]
+        path: PathBuf,
+
+        #[arg(
+            long,
+            help = "Target platform (e.g. rp2350, esp32c5, macOS)"
+        )]
+        platform: Option<String>,
+
+        #[arg(
+            long,
+            help = "Build configuration (e.g. debug, release)"
+        )]
+        configuration: Option<String>,
+
+        #[arg(long, help = "Emit execution report as JSON")]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -170,8 +237,196 @@ fn main() -> Result<()> {
         }
         Some(Commands::Jobs { json }) => list_jobs(json),
         Some(Commands::Job { name }) => run_job(&name),
+        Some(Commands::ParseSwift {
+            path,
+            platform,
+            configuration,
+            json,
+            emit_llvm,
+            emit_ninja,
+            dump_package,
+            dump_ast_json,
+        }) => run_parse_swift(
+            &path,
+            platform.as_deref(),
+            configuration.as_deref(),
+            json,
+            emit_llvm,
+            emit_ninja,
+            dump_package,
+            dump_ast_json,
+        ),
+        Some(Commands::BuildSwift {
+            path,
+            platform,
+            configuration,
+            json,
+        }) => run_build_swift(&path, platform.as_deref(), configuration.as_deref(), json),
         None => run_client(cli),
     }
+}
+
+fn run_build_swift(
+    path: &Path,
+    platform: Option<&str>,
+    configuration: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("Reading Swift manifest '{}'", path.display()))?;
+    let pkg = rbuild::swift_manifest::parse_package_swift(&source)?;
+    let workspace_root = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let actions = rbuild::executor::build_action_graph(
+        &pkg,
+        workspace_root,
+        ".rbuild-out/native",
+        platform,
+        configuration,
+        None,
+        None,
+    );
+    let report = rbuild::executor::execute_action_graph(workspace_root, &actions)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "rbuild build-swift: Built '{}' in {} ms (actions={}, cache_hits={}, executed={}, outputs={:?})",
+            pkg.name,
+            report.elapsed_ms,
+            report.total_actions,
+            report.cache_hits,
+            report.executed_actions,
+            report.built_outputs
+        );
+    }
+    Ok(())
+}
+
+fn run_parse_swift(
+    path: &Path,
+    platform: Option<&str>,
+    configuration: Option<&str>,
+    json: bool,
+    emit_llvm: bool,
+    emit_ninja: bool,
+    dump_package: bool,
+    dump_ast_json: bool,
+) -> Result<()> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("Reading Swift manifest '{}'", path.display()))?;
+
+    if dump_ast_json {
+        let ast_val =
+            rbuild::swift_compat::emit_swift_ast_json(&source, &path.to_string_lossy())?;
+        println!("{}", serde_json::to_string_pretty(&ast_val)?);
+        return Ok(());
+    }
+
+    if emit_llvm {
+        let module_name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Package".to_string());
+        let ir = rbuild::swift_manifest::emit_llvm_ir(&source, &module_name)?;
+        print!("{ir}");
+        return Ok(());
+    }
+
+    let start = std::time::Instant::now();
+    let packages = rbuild::swift_manifest::parse_packages_swift(&source)?;
+    let elapsed = start.elapsed();
+
+    if packages.is_empty() {
+        anyhow::bail!(
+            "No `struct <Name>: Package` conformance or `Package(...)` initializer found in '{}'",
+            path.display()
+        );
+    }
+
+    if dump_package {
+        let root_dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let canonical_root = fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
+        let dumped =
+            rbuild::swift_compat::to_swift_dump_package_json(&packages[0], Some(&canonical_root));
+        println!("{}", serde_json::to_string_pretty(&dumped)?);
+        return Ok(());
+    }
+
+    if emit_ninja {
+        for pkg in &packages {
+            print!("{}", pkg.emit_build_ninja(platform, configuration));
+        }
+        return Ok(());
+    }
+
+    if json {
+        let first = &packages[0];
+        let first_plan = first.resolve_plan(platform, configuration);
+        let all_entries: Vec<serde_json::Value> = packages
+            .iter()
+            .map(|pkg| {
+                serde_json::json!({
+                    "manifest": pkg,
+                    "resolved_plan": pkg.resolve_plan(platform, configuration),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "parse_time_micros": elapsed.as_micros(),
+                "manifest": first,
+                "resolved_plan": first_plan,
+                "packages": all_entries,
+            }))?
+        );
+    } else {
+        for manifest in &packages {
+            let plan = manifest.resolve_plan(platform, configuration);
+            let origin_desc = match &manifest.origin {
+                rbuild::swift_manifest::PackageOrigin::ProtocolConformance { type_name } => {
+                    format!("struct {type_name}: Package")
+                }
+                rbuild::swift_manifest::PackageOrigin::InitializerCall => {
+                    "Package(...)".to_string()
+                }
+            };
+            println!(
+                "Parsed '{}' in {:.2?} (package='{}' [{}], tools_version={:?}, targets={})",
+                path.display(),
+                elapsed,
+                manifest.name,
+                origin_desc,
+                manifest.tools_version,
+                manifest.targets.len()
+            );
+            for target in &plan {
+                println!(
+                    "  - [{}] {} (path='{}', deps={:?}, cxx_flags={:?}, linker_flags={:?}, format={:?})",
+                    match target.kind {
+                        rbuild::swift_manifest::TargetKind::Regular => "lib",
+                        rbuild::swift_manifest::TargetKind::Executable => "bin",
+                        rbuild::swift_manifest::TargetKind::Test => "test",
+                        rbuild::swift_manifest::TargetKind::System => "sys",
+                        rbuild::swift_manifest::TargetKind::Binary => "bin-artifact",
+                    },
+                    target.name,
+                    target.effective_path,
+                    target.dependencies,
+                    target.cxx_flags,
+                    target.linker_flags,
+                    target.output_format,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn project_config() -> Result<ProjectConfig> {
@@ -216,6 +471,7 @@ fn run_job(name: &str) -> Result<()> {
                 .args(args)
                 .current_dir(&cwd)
                 .env("RBUILD_ARTIFACTS_DIR", &artifacts_dir)
+                .envs(&job.env)
                 .status()?;
             if !status.success() {
                 anyhow::bail!("Local job '{name}' failed with {status}");
@@ -234,6 +490,15 @@ fn run_job(name: &str) -> Result<()> {
         if let Some(backend) = &job.backend {
             command.arg("--backend").arg(backend);
         }
+        if let Some(bazelisk_path) = &job.bazelisk_path {
+            command.arg("--bazelisk-path").arg(bazelisk_path);
+        }
+        if let Some(cargo_path) = &job.cargo_path {
+            command.arg("--cargo-path").arg(cargo_path);
+        }
+        for entry in &job.remote_path_entries {
+            command.arg("--remote-path-entry").arg(entry);
+        }
         command
             .args(&job.args)
             .current_dir(&cwd)
@@ -242,6 +507,7 @@ fn run_job(name: &str) -> Result<()> {
             "RBUILD_JOB_ARTIFACTS",
             serde_json::to_string(&job.artifacts)?,
         );
+        command.env("RBUILD_JOB_ENV", serde_json::to_string(&job.env)?);
         let status = command.status()?;
         if !status.success() {
             anyhow::bail!("Remote job '{name}' failed with {status}");
@@ -279,7 +545,7 @@ fn run_client(cli: Cli) -> Result<()> {
     });
 
     let requested_transport = cli.transport.as_deref().unwrap_or(&selected.transport);
-    if requested_transport == "ssh" && !workers.is_empty() {
+    if requested_transport == "ssh" && workers.len() > 1 {
         let start = workers
             .iter()
             .position(|w| w.name == selected.name)
@@ -326,6 +592,12 @@ fn run_client(cli: Cli) -> Result<()> {
     let project = project_config()?;
     let resolved_deps = resolve_and_validate_deps(&current_dir, &repo_name, &project.deps)
         .map_err(anyhow::Error::msg)?;
+    let mut effective_excludes = cfg.excludes.clone();
+    for ex in &project.excludes {
+        if !effective_excludes.contains(ex) {
+            effective_excludes.push(ex.clone());
+        }
+    }
 
     let worktree_name = cli.worktree.unwrap_or_else(|| "main".to_string());
     let backend = select_backend(
@@ -353,13 +625,14 @@ fn run_client(cli: Cli) -> Result<()> {
     );
 
     let params = SessionWorkflowParams {
+        already_handshaked: false,
         local_exe_for_update: None,
         current_dir: &current_dir,
         client_id: &client_id,
         repo_name: &repo_name,
         worktree_name: &worktree_name,
         resolved_deps: &resolved_deps,
-        excludes: &cfg.excludes,
+        excludes: &effective_excludes,
         backend,
         artifact_globs: &cfg.artifact_globs,
         bazel_args: &cli.bazel_args,
@@ -384,26 +657,32 @@ fn run_client(cli: Cli) -> Result<()> {
             })?;
             let transport = SshTransport::spawn(&dest, &agent_path, Some(&build_root))?;
             let mut session = ClientSession::new(transport);
-            if let Err(error) = session.handshake(None) {
-                if error
-                    .to_string()
-                    .contains("Cannot self-update cross-platform agent")
+            match session.handshake(None) {
+                Ok(()) => {
+                    println!("rbuild: Handshake successful.");
+                    let mut ssh_params = params;
+                    ssh_params.already_handshaked = true;
+                    run_session_workflow(session, &ssh_params)
+                }
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("Cannot self-update cross-platform agent") =>
                 {
+                    drop(session);
                     build_and_install_native_agent(
                         &dest,
                         &agent_path,
                         Path::new(env!("CARGO_MANIFEST_DIR")),
                     )
                     .context("Building and installing native worker agent")?;
-                } else {
-                    return Err(error);
+                    let transport = SshTransport::spawn(&dest, &agent_path, Some(&build_root))?;
+                    let session = ClientSession::new(transport);
+                    // In cross-platform environments (e.g. macOS client -> Linux agent), local binary must not be uploaded
+                    run_session_workflow(session, &params)
                 }
+                Err(error) => Err(error),
             }
-            drop(session);
-            let transport = SshTransport::spawn(&dest, &agent_path, Some(&build_root))?;
-            let session = ClientSession::new(transport);
-            // In cross-platform environments (e.g. macOS client -> Linux agent), local binary must not be uploaded
-            run_session_workflow(session, &params)
         }
         other => {
             anyhow::bail!("Unsupported transport '{}'. Use 'local' or 'ssh'", other);
@@ -421,6 +700,7 @@ struct RemoteOptions {
 
 #[derive(Clone)]
 struct SessionWorkflowParams<'a> {
+    already_handshaked: bool,
     local_exe_for_update: Option<&'a Path>,
     current_dir: &'a Path,
     client_id: &'a str,
@@ -442,9 +722,15 @@ fn run_session_workflow<T: Transport>(
         .ok()
         .and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or_default();
+    let job_envs: std::collections::BTreeMap<String, String> = std::env::var("RBUILD_JOB_ENV")
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
     // Handshake
-    session.handshake(params.local_exe_for_update)?;
-    println!("rbuild: Handshake successful.");
+    if !params.already_handshaked {
+        session.handshake(params.local_exe_for_update)?;
+        println!("rbuild: Handshake successful.");
+    }
 
     // Sync dependencies first (if any)
     let mut dep_remote_paths = Vec::new();
@@ -498,7 +784,10 @@ fn run_session_workflow<T: Transport>(
             .iter()
             .map(|(dep, path)| (dep.name.as_str(), path.as_str()))
             .collect();
-        let command_envs = build_dep_command_envs(&params.remote.path_envs, &dep_path_pairs);
+        let mut command_envs = build_dep_command_envs(&params.remote.path_envs, &dep_path_pairs);
+        for (k, v) in job_envs {
+            command_envs.push((k, v));
+        }
 
         if params.backend == BackendKind::Cargo {
             let mut args = if params.bazel_args.first().is_some_and(|s| s == "build") {

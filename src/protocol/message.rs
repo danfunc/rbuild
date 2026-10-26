@@ -126,6 +126,8 @@ pub enum Message {
         flags: Vec<String>,
         #[serde(default)]
         envs: Vec<(String, String)>,
+        #[serde(default)]
+        known_artifacts: std::collections::BTreeMap<String, String>,
     },
     CollectArtifactsResponse {
         ok: bool,
@@ -133,6 +135,9 @@ pub enum Message {
         error: Option<String>,
     },
     ArtifactChunk(SyncFileChunk),
+    ArtifactUnchanged {
+        path: String,
+    },
     ArtifactStart {
         path: String,
         mode: u32,
@@ -150,6 +155,8 @@ pub enum Message {
     },
     CollectPathsRequest {
         paths: Vec<String>,
+        #[serde(default)]
+        known_artifacts: std::collections::BTreeMap<String, String>,
     },
     CollectPathsResponse {
         ok: bool,

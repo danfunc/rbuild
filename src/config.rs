@@ -49,6 +49,8 @@ pub struct Config {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectConfig {
+    #[serde(default, alias = "extra_excludes")]
+    pub excludes: Vec<String>,
     #[serde(default)]
     pub jobs: BTreeMap<String, JobConfig>,
     #[serde(default)]
@@ -212,6 +214,14 @@ pub struct JobConfig {
     pub worker: String,
     #[serde(default)]
     pub backend: Option<String>,
+    #[serde(default)]
+    pub bazelisk_path: Option<String>,
+    #[serde(default)]
+    pub cargo_path: Option<String>,
+    #[serde(default)]
+    pub remote_path_entries: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -875,5 +885,41 @@ args = ["build", "//pkg:app"]
         // Empty deps leaves base envs unchanged
         let empty_result = build_dep_command_envs(&base_envs, &[]);
         assert_eq!(empty_result, base_envs);
+    }
+
+    #[test]
+    fn test_project_excludes_and_job_tool_and_env_overrides() {
+        let toml_str = r#"
+excludes = ["compile_commands.json", "docs/"]
+
+[jobs.build_c5]
+worker = "main-lxc"
+backend = "bazel"
+bazelisk_path = "/home/user/.local/bin/bazelisk-c5"
+remote_path_entries = ["/home/user/.local/bin"]
+args = ["build", "--config=esp32c5", "//firmware:esp32c5"]
+
+[jobs.build_c5.env]
+IDF_PATH = "/home/user/.local/esp-idf-c5-v6.1"
+CMAKE_BUILD_PARALLEL_LEVEL = "2"
+"#;
+        let project: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(project.excludes, vec!["compile_commands.json", "docs/"]);
+        let job = &project.jobs["build_c5"];
+        assert_eq!(
+            job.bazelisk_path.as_deref(),
+            Some("/home/user/.local/bin/bazelisk-c5")
+        );
+        assert_eq!(job.remote_path_entries, vec!["/home/user/.local/bin"]);
+        assert_eq!(
+            job.env.get("IDF_PATH").map(String::as_str),
+            Some("/home/user/.local/esp-idf-c5-v6.1")
+        );
+        assert_eq!(
+            job.env
+                .get("CMAKE_BUILD_PARALLEL_LEVEL")
+                .map(String::as_str),
+            Some("2")
+        );
     }
 }

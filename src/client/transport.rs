@@ -105,10 +105,19 @@ pub fn build_ssh_args(destination: &str, agent_bin: &str, base_dir: Option<&str>
     ]
 }
 
-/// Creates a `std::process::Command` configured to invoke OpenSSH with safe arguments.
+/// Creates a `std::process::Command` configured to invoke OpenSSH with safe arguments
+/// and persistent connection multiplexing (`ControlMaster` / `ControlPersist`).
 pub fn build_ssh_command(destination: &str, agent_bin: &str, base_dir: Option<&str>) -> Command {
     let args = build_ssh_args(destination, agent_bin, base_dir);
     let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPath=/tmp/rbuild-ssh-%C",
+        "-o",
+        "ControlPersist=600",
+    ]);
     cmd.args(args);
     cmd
 }
@@ -123,6 +132,12 @@ pub fn probe_ssh(destination: &str) -> Result<()> {
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPath=/tmp/rbuild-ssh-%C",
+            "-o",
+            "ControlPersist=600",
             destination,
             "true",
         ])
@@ -154,7 +169,7 @@ pub fn build_and_install_native_agent(
     let mut ssh = Command::new("ssh");
     ssh.args(["-T", "-o", "BatchMode=yes", destination]);
     let script = format!(
-        "set -eu; d=$(mktemp -d); target={}; case \"$target\" in */*) ;; *) target=$(command -v \"$target\") ;; esac; parent=$(dirname \"$target\"); mkdir -p \"$parent\"; tmp=\"$parent/.rbuild-agent.$$\"; trap 'rm -rf \"$d\"; rm -f \"$tmp\"' EXIT; tar -xzf - -C \"$d\"; cargo build --release --manifest-path \"$d/Cargo.toml\"; install -m 755 \"$d/target/release/rbuild\" \"$tmp\"; mv -f \"$tmp\" \"$target\"",
+        "set -eu; export PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$PATH\"; d=$(mktemp -d); target={}; case \"$target\" in */*) ;; *) target=$(command -v \"$target\") ;; esac; parent=$(dirname \"$target\"); mkdir -p \"$parent\"; tmp=\"$parent/.rbuild-agent.$$\"; trap 'rm -rf \"$d\"; rm -f \"$tmp\"' EXIT; tar -xzf - -C \"$d\"; cargo build --release --manifest-path \"$d/Cargo.toml\"; install -m 755 \"$d/target/release/rbuild\" \"$tmp\"; mv -f \"$tmp\" \"$target\"",
         shell_quote(agent_bin)
     );
     ssh.arg(script)

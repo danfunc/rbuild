@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseArguments, debugMapPatch } from '../src/helpers';
+import { parseArguments, debugMapPatch, formatPackagesSummary } from '../src/helpers';
 
 test('legacy arguments remain available when projects have no jobs', () => {
   assert.deepEqual(parseArguments(['build', '//demo:app']), ['build', '//demo:app']);
@@ -10,6 +10,29 @@ test('debug source map maps the remote root to the local root', () => {
   assert.deepEqual(debugMapPatch('/srv/build/u/repo/main', '/work/repo'), {
     '/srv/build/u/repo/main': '/work/repo',
   });
+});
+
+test('formatPackagesSummary renders Package protocol conformance and targets', () => {
+  const sample = {
+    parse_time_micros: 84,
+    packages: [
+      {
+        manifest: {
+          name: 'Shizuku',
+          origin: { protocol_conformance: { type_name: 'Shizuku' } },
+        },
+        resolved_plan: [
+          { name: 'ShizukuCore', kind: 'regular', effective_path: 'firmware/core', dependencies: ['eigen:Eigen'] },
+          { name: 'shizuku', kind: 'executable', effective_path: 'firmware', dependencies: ['ShizukuCore'], output_format: 'uf2 (rp2350ArmS)' },
+        ],
+      },
+    ],
+  };
+  assert.deepEqual(formatPackagesSummary(sample), [
+    '[package] Shizuku [struct Shizuku: Package] (84µs)',
+    '  - [regular] ShizukuCore (firmware/core) deps=[eigen:Eigen]',
+    '  - [executable] shizuku (firmware) deps=[ShizukuCore] format=uf2 (rp2350ArmS)',
+  ]);
 });
 
 import { parseProgressLine, estimateBuildPercent, isCargoProgressBar, formatBytes, prefixLine, finishLine, describeTransfer, overallPercent, OutputFormatter, LineSplitter } from '../src/helpers';

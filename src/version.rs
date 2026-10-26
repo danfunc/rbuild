@@ -4,7 +4,9 @@ use std::path::Path;
 ///
 /// 2: `CollectArtifactsRequest.envs` and the reserved `RBUILD_PATH_PREPEND` env key.
 /// 3: artifact output-root query receives `--override_module` flags.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4: remote worktree manifest cache (`.rbuild/manifest_cache.json`) avoids re-hashing unchanged files.
+/// 5: `known_artifacts` and `ArtifactUnchanged`, plus remote Bazel query caching and pipelined sync.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Returns the build ID of the current binary or environment.
 ///

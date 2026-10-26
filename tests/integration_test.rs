@@ -189,6 +189,25 @@ fn test_end_to_end_sync_and_differential_update_with_git() {
         "Deleted file must be removed on remote"
     );
 
+    // Verify remote manifest cache was persisted and pruned deleted files
+    let remote_cache_path = remote_wt.join(".rbuild/manifest_cache.json");
+    assert!(
+        remote_cache_path.exists(),
+        "Remote worktree manifest cache must be persisted"
+    );
+    let remote_cache = ManifestCache::load_from_file(&remote_cache_path);
+    assert!(remote_cache.entries.contains_key("file1.txt"));
+    assert!(remote_cache.entries.contains_key("new_file.txt"));
+    assert!(!remote_cache.entries.contains_key("sub/dir/untracked.txt"));
+
+    // 3. Third sync with no changes must transfer 0 files and delete 0 files
+    let stats3 = session
+        .sync_workspace(&source_dir, &mut cache, &[])
+        .unwrap();
+    assert_eq!(stats3.files_checked, 5);
+    assert_eq!(stats3.files_transferred, 0);
+    assert_eq!(stats3.files_deleted, 0);
+
     drop(session);
     let _ = agent_thread.join();
 }

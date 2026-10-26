@@ -6,7 +6,10 @@ use crate::agent::updater::update_agent_binary;
 use crate::protocol::message::{Message, PATH_PREPEND_ENV, SyncFileChunk};
 use crate::protocol::{read_message, write_message};
 use crate::sync::apply::{apply_deletions, apply_file_chunk};
-use crate::sync::diff::calculate_diff;
+use crate::sync::diff::{
+    calculate_diff_with_cache, record_synced_file_in_cache, worktree_cache_path,
+};
+use crate::sync::manifest::ManifestCache;
 use crate::sync::path_safety::is_safe_relative_path;
 use crate::version::{PROTOCOL_VERSION, get_current_build_id};
 use anyhow::{Context, Result};
@@ -22,6 +25,7 @@ pub struct AgentSession {
     pub agent_bin_path: Option<PathBuf>,
     pub current_worktree: Option<PathBuf>,
     pub active_locks: Vec<WorktreeLock>,
+    pub manifest_cache: ManifestCache,
     pub pending_deletions: Vec<String>,
     pub updated_count: usize,
     pub deleted_count: usize,
@@ -34,6 +38,7 @@ impl AgentSession {
             agent_bin_path,
             current_worktree: None,
             active_locks: Vec::new(),
+            manifest_cache: ManifestCache::default(),
             pending_deletions: Vec::new(),
             updated_count: 0,
             deleted_count: 0,
@@ -122,6 +127,8 @@ impl AgentSession {
                 let wt_path = self.base_dir.join(&client_id).join(&repo).join(&worktree);
                 match WorktreeLock::acquire(&wt_path) {
                     Ok(lock) => {
+                        self.manifest_cache =
+                            ManifestCache::load_from_file(&worktree_cache_path(&wt_path));
                         self.current_worktree = Some(wt_path.clone());
                         self.active_locks.push(lock);
                         let resp = Message::LockWorktreeResponse {
@@ -155,8 +162,11 @@ impl AgentSession {
                     }
                 };
 
-                match calculate_diff(wt, &entries) {
+                match calculate_diff_with_cache(wt, &entries, &mut self.manifest_cache) {
                     Ok(diff) => {
+                        if wt.exists() {
+                            let _ = self.manifest_cache.save_to_file(&worktree_cache_path(wt));
+                        }
                         self.pending_deletions = diff.deleted_files.clone();
                         self.updated_count = 0;
                         self.deleted_count = 0;
@@ -193,6 +203,12 @@ impl AgentSession {
                 let path = chunk.path.clone();
                 match apply_file_chunk(wt, &chunk) {
                     Ok(()) => {
+                        record_synced_file_in_cache(
+                            wt,
+                            &mut self.manifest_cache,
+                            &chunk.path,
+                            &chunk.blake3,
+                        );
                         self.updated_count += 1;
                         let resp = Message::SyncFileResponse {
                             path,
@@ -240,6 +256,12 @@ impl AgentSession {
                         return Ok(true);
                     }
                 };
+                for deleted in &self.pending_deletions {
+                    self.manifest_cache.entries.remove(deleted);
+                }
+                if wt.exists() {
+                    let _ = self.manifest_cache.save_to_file(&worktree_cache_path(wt));
+                }
                 self.deleted_count = del_count;
                 self.pending_deletions.clear();
 
@@ -357,6 +379,7 @@ impl AgentSession {
                 targets,
                 flags,
                 envs,
+                known_artifacts,
             } => {
                 let wt = match &self.current_worktree {
                     Some(w) => w.clone(),
@@ -385,70 +408,59 @@ impl AgentSession {
                 };
 
                 let bin = command.unwrap_or_else(|| "bazelisk".to_string());
-                let mut cmd = remote_command(&bin, &wt, &envs);
-                cmd.arg("cquery")
-                    .arg("--output=files")
-                    .arg(expr)
-                    .args(&flags);
-
-                let output = match cmd.output() {
-                    Ok(out) => out,
-                    Err(e) => {
-                        let resp = Message::CollectArtifactsResponse {
-                            ok: false,
-                            artifact_count: 0,
-                            error: Some(format!("Failed to execute cquery with '{}': {}", bin, e)),
-                        };
-                        write_message(writer, &resp)?;
-                        return Ok(true);
-                    }
-                };
-
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let resp = Message::CollectArtifactsResponse {
-                        ok: false,
-                        artifact_count: 0,
-                        error: Some(format!(
-                            "cquery exited with status {}: {}",
-                            output.status,
-                            stderr.trim()
-                        )),
-                    };
-                    write_message(writer, &resp)?;
-                    return Ok(true);
-                }
-
-                let stdout_str = String::from_utf8_lossy(&output.stdout);
-                let mut artifact_count = 0;
+                let mut query_cache = BazelQueryCache::load(&wt);
+                let cquery_key = format!("{bin}\0{expr}\0{}", flags.join("\0"));
 
                 // The Bazel output root is queried at most once, and only if a file lies outside the worktree.
                 let mut output_root: Option<PathBuf> = None;
-                let mut query_output_root = || -> Result<PathBuf> {
+                let mut query_output_root = |cache: &mut BazelQueryCache| -> Result<PathBuf> {
                     if let Some(root) = &output_root {
                         return Ok(root.clone());
                     }
-                    let root = query_bazel_output_root(&bin, &wt, &flags, &envs)?;
+                    let root = query_bazel_output_root(&bin, &wt, &flags, &envs, cache)?;
                     output_root = Some(root.clone());
                     Ok(root)
                 };
 
-                for line in stdout_str.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
+                let resolved_artifacts = if let Some(cached_lines) =
+                    query_cache.cquery_files.get(&cquery_key).cloned()
+                {
+                    let mut list = Vec::with_capacity(cached_lines.len());
+                    let mut all_valid = !cached_lines.is_empty();
+                    for line in &cached_lines {
+                        match resolve_artifact_file(&wt, line, &mut || {
+                            query_output_root(&mut query_cache)
+                        }) {
+                            Ok(pair) => list.push(pair),
+                            Err(_) => {
+                                all_valid = false;
+                                break;
+                            }
+                        }
                     }
+                    if all_valid { Some(list) } else { None }
+                } else {
+                    None
+                };
 
-                    let (rel_path, actual_path) =
-                        match resolve_artifact_file(&wt, trimmed, &mut query_output_root) {
-                            Ok(res) => res,
+                let resolved_artifacts = match resolved_artifacts {
+                    Some(list) => list,
+                    None => {
+                        let mut cmd = remote_command(&bin, &wt, &envs);
+                        cmd.arg("cquery")
+                            .arg("--output=files")
+                            .arg(&expr)
+                            .args(&flags);
+
+                        let output = match cmd.output() {
+                            Ok(out) => out,
                             Err(e) => {
                                 let resp = Message::CollectArtifactsResponse {
                                     ok: false,
-                                    artifact_count,
+                                    artifact_count: 0,
                                     error: Some(format!(
-                                        "Failed to resolve artifact '{}': {}",
-                                        trimmed, e
+                                        "Failed to execute cquery with '{}': {}",
+                                        bin, e
                                     )),
                                 };
                                 write_message(writer, &resp)?;
@@ -456,7 +468,63 @@ impl AgentSession {
                             }
                         };
 
-                    if let Err(e) = send_artifact_frames(writer, &rel_path, &actual_path) {
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let resp = Message::CollectArtifactsResponse {
+                                ok: false,
+                                artifact_count: 0,
+                                error: Some(format!(
+                                    "cquery exited with status {}: {}",
+                                    output.status,
+                                    stderr.trim()
+                                )),
+                            };
+                            write_message(writer, &resp)?;
+                            return Ok(true);
+                        }
+
+                        let stdout_str = String::from_utf8_lossy(&output.stdout);
+                        let mut lines = Vec::new();
+                        let mut list = Vec::new();
+                        for line in stdout_str.lines() {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            match resolve_artifact_file(&wt, trimmed, &mut || {
+                                query_output_root(&mut query_cache)
+                            }) {
+                                Ok(pair) => {
+                                    lines.push(trimmed.to_string());
+                                    list.push(pair);
+                                }
+                                Err(e) => {
+                                    let resp = Message::CollectArtifactsResponse {
+                                        ok: false,
+                                        artifact_count: 0,
+                                        error: Some(format!(
+                                            "Failed to resolve artifact '{}': {}",
+                                            trimmed, e
+                                        )),
+                                    };
+                                    write_message(writer, &resp)?;
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                        if !lines.is_empty() {
+                            query_cache.cquery_files.insert(cquery_key, lines);
+                            query_cache.save(&wt);
+                        }
+                        list
+                    }
+                };
+
+                let mut artifact_count = 0;
+                for (rel_path, actual_path) in resolved_artifacts {
+                    if let Err(e) =
+                        send_artifact_frames(writer, &rel_path, &actual_path, &known_artifacts)
+                    {
                         let resp = Message::CollectArtifactsResponse {
                             ok: false,
                             artifact_count,
@@ -478,7 +546,10 @@ impl AgentSession {
                 )?;
             }
 
-            Message::CollectPathsRequest { paths } => {
+            Message::CollectPathsRequest {
+                paths,
+                known_artifacts,
+            } => {
                 let wt = match &self.current_worktree {
                     Some(w) => w.clone(),
                     None => {
@@ -554,7 +625,9 @@ impl AgentSession {
                             return Ok(true);
                         }
                     };
-                    if let Err(e) = send_artifact_frames(writer, &rel, &canonical_path) {
+                    if let Err(e) =
+                        send_artifact_frames(writer, &rel, &canonical_path, &known_artifacts)
+                    {
                         write_message(
                             writer,
                             &Message::CollectPathsResponse {
@@ -701,18 +774,62 @@ pub fn build_cquery_set_expression<S: AsRef<str>>(targets: &[S]) -> Result<Strin
     Ok(expr)
 }
 
-/// Asks Bazel for its `output_path` in the worktree. No local fallback is attempted.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct BazelQueryCache {
+    output_roots: std::collections::BTreeMap<String, String>,
+    cquery_files: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl BazelQueryCache {
+    fn path(worktree: &Path) -> PathBuf {
+        worktree.join(".rbuild/bazel_query_cache.json")
+    }
+
+    fn load(worktree: &Path) -> Self {
+        let path = Self::path(worktree);
+        if let Ok(bytes) = fs::read(&path) {
+            if let Ok(cache) = serde_json::from_slice(&bytes) {
+                return cache;
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self, worktree: &Path) {
+        if !worktree.exists() {
+            return;
+        }
+        let path = Self::path(worktree);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
+            let _ = fs::write(path, bytes);
+        }
+    }
+}
+
+/// Asks Bazel for its `output_path` in the worktree, caching the result per override configuration.
+/// No local fallback is attempted.
 fn query_bazel_output_root(
     bin: &str,
     worktree: &Path,
     flags: &[String],
     envs: &[(String, String)],
+    cache: &mut BazelQueryCache,
 ) -> Result<PathBuf> {
     let override_flags: Vec<&str> = flags
         .iter()
         .map(String::as_str)
         .filter(|f| f.starts_with("--override_module="))
         .collect();
+    let cache_key = format!("{bin}\0{}", override_flags.join("\0"));
+    if let Some(cached) = cache.output_roots.get(&cache_key) {
+        let cached_path = PathBuf::from(cached);
+        if cached_path.is_absolute() && cached_path.exists() {
+            return Ok(cached_path);
+        }
+    }
 
     // Repo-local build rc entries can refer to repositories only materialized under a
     // particular build configuration. `info` needs no project rc, and must still work
@@ -751,6 +868,10 @@ fn query_bazel_output_root(
             stdout.trim()
         );
     }
+    cache
+        .output_roots
+        .insert(cache_key, root.to_string_lossy().to_string());
+    cache.save(worktree);
     Ok(root)
 }
 
@@ -845,6 +966,7 @@ fn send_artifact_frames<W: Write>(
     writer: &mut W,
     rel_path: &str,
     actual_path: &Path,
+    known_artifacts: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let meta = fs::symlink_metadata(actual_path)?;
     if meta.file_type().is_symlink() {
@@ -865,13 +987,26 @@ fn send_artifact_frames<W: Write>(
         }
         hasher.update(&buffer[..n]);
     }
+    let blake3_hex = hasher.finalize().to_hex().to_string();
+    if known_artifacts
+        .get(rel_path)
+        .is_some_and(|known| known == &blake3_hex)
+    {
+        write_message(
+            writer,
+            &Message::ArtifactUnchanged {
+                path: rel_path.to_string(),
+            },
+        )?;
+        return Ok(());
+    }
     write_message(
         writer,
         &Message::ArtifactStart {
             path: rel_path.to_string(),
             mode: meta.permissions().mode(),
             raw_len: meta.len(),
-            blake3: hasher.finalize().to_hex().to_string(),
+            blake3: blake3_hex,
         },
     )?;
     let mut file = fs::File::open(actual_path)?;
@@ -1346,6 +1481,7 @@ mod tests {
             targets: vec![r#"//pkg:target'"both"#.to_string()],
             flags: vec![],
             envs: vec![],
+            known_artifacts: Default::default(),
         };
 
         session.handle_message(&mut output, collect_req).unwrap();
